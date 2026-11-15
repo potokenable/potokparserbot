@@ -5,7 +5,7 @@ import os
 import random
 import re
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import qrcode
 from telethon import TelegramClient, events, Button
@@ -31,6 +31,7 @@ SESSION_FILE = os.path.join(DATA_DIR, "session_string.txt")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 BLACKLIST_FILE = os.path.join(DATA_DIR, "blacklist.json")
+BOTS_WHITELIST_FILE = os.path.join(DATA_DIR, "known_giveaway_bots.json")
 
 # ---------- НАСТРОЙКИ ----------
 MESSAGES_TO_CHECK = 50
@@ -38,6 +39,13 @@ DELAY_BETWEEN_CHANNELS = 1.0
 DELAY_BETWEEN_PARTICIPATION = 2.0
 AUTO_SCAN_INTERVAL = 900
 MAX_CHANNELS_PER_PROFILE = 100
+MAX_POST_AGE_DAYS = 30  # Исключать посты старше 1 месяца
+
+# Популярные боты-рандомайзеры и сервисы розыгрышей (username без @)
+DEFAULT_GIVEAWAY_BOTS = [
+    "givesharebot", "voterbibot", "randstuff_bot", "random1zebot",
+    "givaway_bot", "getlike_bot", "contestsbot", "lizaonair_bot"
+]
 
 PRESET_CHANNELS = [
     "gtavi247", "cyberleekgtaviofficial", "gta6deluxe", "gta_6_play",
@@ -166,6 +174,23 @@ def save_blacklist(bl: list):
     with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
         json.dump(bl, f, ensure_ascii=False, indent=2)
 
+def load_giveaway_bots() -> list:
+    ensure_data_dir()
+    if not os.path.exists(BOTS_WHITELIST_FILE):
+        save_giveaway_bots(DEFAULT_GIVEAWAY_BOTS)
+        return DEFAULT_GIVEAWAY_BOTS
+    try:
+        with open(BOTS_WHITELIST_FILE, "r", encoding="utf-8") as f:
+            bots = json.load(f)
+            return list(set(bots + DEFAULT_GIVEAWAY_BOTS))
+    except Exception:
+        return DEFAULT_GIVEAWAY_BOTS
+
+def save_giveaway_bots(bots: list):
+    ensure_data_dir()
+    with open(BOTS_WHITELIST_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(set(bots)), f, ensure_ascii=False, indent=2)
+
 def load_state() -> dict:
     ensure_data_dir()
     if not os.path.exists(STATE_FILE):
@@ -214,10 +239,50 @@ def contains_any(text: str, keywords) -> bool:
     norm = normalize_text(text)
     return any(normalize_text(kw) in norm for kw in keywords if kw)
 
+def extract_bot_username_from_url(url: str) -> str:
+    if not url:
+        return ""
+    match = re.search(r"t\.me/([a-zA-Z0-9_]+)", url)
+    return match.group(1).lower() if match else ""
+
+def is_from_giveaway_bot(msg) -> bool:
+    known_bots = [b.lower() for b in load_giveaway_bots()]
+    
+    # 1. Проверка через via_bot (инлайн боты)
+    via_bot_id = getattr(msg, "via_bot_id", None)
+    if via_bot_id:
+        return True  # Инлайн боты часто используются для интерактивных конкурсов
+
+    # 2. Проверка через пересылку (fwd_from)
+    fwd = getattr(msg, "fwd_from", None)
+    if fwd and getattr(fwd, "from_id", None):
+        # Если переслано от юзера/бота (в Telethon ID бота можно проверить отдельно или сохранить)
+        pass
+
+    # 3. Проверка кнопок на наличие ссылок на ботов
+    if msg.buttons:
+        for row in msg.buttons:
+            for btn in row:
+                url = getattr(btn, "url", "")
+                if url:
+                    b_name = extract_bot_username_from_url(url)
+                    if b_name in known_bots:
+                        return True
+    return False
+
 def is_relevant_post(msg, profile: dict, ch_title: str = "", ch_username: str = "") -> bool:
     text = getattr(msg, "text", None)
     if not text:
         return False
+
+    # Исключение старых постов (старше 30 дней)
+    if msg.date:
+        msg_date = msg.date
+        if msg_date.tzinfo is None:
+            msg_date = msg_date.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if (now - msg_date) > timedelta(days=MAX_POST_AGE_DAYS):
+            return False
 
     # Проверка черного списка каналов
     blacklist = load_blacklist()
@@ -227,7 +292,17 @@ def is_relevant_post(msg, profile: dict, ch_title: str = "", ch_username: str = 
     contest_kw = profile.get("contest_keywords", GIVEAWAY_MARKERS)
     topic_kw = profile.get("topic_keywords", [])
 
-    if not contains_any(text, contest_kw):
+    has_contest_markers = contains_any(text, contest_kw)
+    is_bot_post = is_from_giveaway_bot(msg)
+
+    # Если пост от проверенного бота-рандомайзера, порог доверия выше
+    if is_bot_post:
+        # Проверяем хотя бы наличие топика или ключевика игры
+        if topic_kw and not (contains_any(text, topic_kw) or contains_any(ch_title, topic_kw)):
+            return False
+        return True
+
+    if not has_contest_markers:
         return False
 
     if topic_kw:
@@ -315,8 +390,21 @@ async def try_participate(u_client, msg, channel_username: str, message_id: int)
             return ("link_only", "Нет интерактивных кнопок")
 
         btn = find_participate_button(msg) or find_subscribe_button(msg)
-        if btn is None or getattr(btn, "url", None):
+        if btn is None:
             return ("link_only", "Кнопка не найдена")
+
+        # Если кнопка со ссылкой на бота, пытаемся вытащить имя бота и сохранить в белый список
+        url = getattr(btn, "url", None)
+        if url:
+            b_name = extract_bot_username_from_url(url)
+            if b_name:
+                bots = load_giveaway_bots()
+                if b_name not in bots:
+                    bots.append(b_name)
+                    save_giveaway_bots(bots)
+
+        if url:
+            return ("link_only", "Ссылка на бота / внешняя ссылка")
 
         await btn.click()
         return ("participated", "OK")
@@ -327,7 +415,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
     global _scan_running, _stop_event
 
     if _scan_running and not debug:
-        await b_client.send_message(cfg["your_id"], "[!] Скан уже запущен или завис. Нажмите «СБРОСИТЬ ЗАВИСАНИЕ» в меню.")
+        await b_client.send_message(cfg["your_id"], "[!] Скан уже запущен. Нажмите «СБРОСИТЬ ЗАВИСАНИЕ» в меню.")
         return
 
     _scan_running = True
@@ -361,7 +449,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
         total_channels = 0
 
         if not auto_mode:
-            await b_client.send_message(cfg["your_id"], "[~] Запущен поиск розыгрышей...")
+            await b_client.send_message(cfg["your_id"], "[~] Запущен поиск розыгрышей (фильтр: не старше 30 дней)...")
 
         for prof_name, data in profiles_to_run.items():
             if _stop_event.is_set():
@@ -475,7 +563,6 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                 f"{p['text'][:300]}...\n\n"
                 f"<a href=\"{p['link']}\">Перейти к посту</a>"
             )
-            # Серые/стандартные кнопки действий с инлайн-функционалом
             buttons = [
                 [Button.url("🔗 Открыть пост", p["link"])],
                 [Button.inline(f"❌ В черный список @{p['channel']}", data=f"bl_add_{p['channel']}".encode())]
@@ -582,7 +669,6 @@ async def setup_bot_handlers(b_client):
             p_name = data.replace("edit_p_", "")
             prof = config_data["profiles"].get(p_name, {})
             ch_kw = ", ".join(prof.get("channel_keywords", []))
-            co_kw = ", ".join(prof.get("contest_keywords", []))
             text = (
                 f"<b>Профиль: {p_name}</b>\n\n"
                 f"Ключи каналов: <code>{ch_kw}</code>\n"
