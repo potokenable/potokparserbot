@@ -2,23 +2,23 @@ import asyncio
 import json
 import os
 import re
+from io import BytesIO
 
+import qrcode
 from telethon import TelegramClient, events
 from telethon.errors import (
     FloodWaitError,
     SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import SearchRequest
-from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.types import Channel, Chat
 
 # ---------- ПУТИ ----------
 DATA_DIR = "data"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TOKEN_FILE = os.path.join(DATA_DIR, "token.txt")
+SESSION_FILE = os.path.join(DATA_DIR, "session_string.txt")
 
 # ---------- КОНФИГ ПО УМОЛЧАНИЮ ----------
 DEFAULT_CONFIG = {
@@ -41,15 +41,13 @@ CONTEST_KEYWORDS = [
 
 MESSAGES_TO_CHECK = 50
 DELAY_BETWEEN_CHANNELS = 3
-AUTH_TIMEOUT = 600  # секунд на ввод кода/пароля через бота
-
+AUTH_TIMEOUT = 600
 
 # ---------- ФАЙЛЫ ----------
 def ensure_data_dir():
     if not os.path.isdir(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
         print(f"[+] Создана папка {DATA_DIR}/")
-
 
 def load_config() -> dict:
     ensure_data_dir()
@@ -67,7 +65,6 @@ def load_config() -> dict:
         raise ValueError(f"В {CONFIG_FILE} не заполнены поля: {', '.join(missing)}")
     return cfg
 
-
 def read_bot_token(path: str) -> str:
     ensure_data_dir()
     if not os.path.exists(path):
@@ -80,11 +77,22 @@ def read_bot_token(path: str) -> str:
         raise ValueError(f"Файл {path} пустой. Вставьте в него токен бота.")
     return token
 
+def read_session_string(path: str):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        s = f.read().strip()
+    return s or None
+
+def save_session_string(path: str, session: str):
+    ensure_data_dir()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(session)
+    print(f"[+] Сессия сохранена в {path}")
 
 # ---------- УТИЛИТЫ ----------
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower().strip())
-
 
 def contains_keywords(text: str, keywords) -> bool:
     if not text:
@@ -92,104 +100,73 @@ def contains_keywords(text: str, keywords) -> bool:
     norm = normalize_text(text)
     return any(normalize_text(kw) in norm for kw in keywords)
 
-
-# ---------- ИНТЕРАКТИВНАЯ АВТОРИЗАЦИЯ ----------
-async def _wait_for_user_input(queue: asyncio.Queue, prompt: str,
-                               bot_client, your_id: int, timeout: int = AUTH_TIMEOUT) -> str:
-    await bot_client.send_message(your_id, prompt)
-    try:
-        return await asyncio.wait_for(queue.get(), timeout=timeout)
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"❌ Таймаут ожидания ответа ({timeout} сек).")
-
-
-async def interactive_auth(cfg: dict, bot_client):
+# ---------- QR-АВТОРИЗАЦИЯ (ВСЁ НА ХОСТИНГЕ) ----------
+async def qr_auth(cfg: dict, bot_client):
     """
-    Авторизует userbot: запрашивает код у Telegram, отправляет пользователю через бота,
-    ждёт код в ответ, при необходимости — 2FA пароль.
+    Авторизация через QR-код.
+    Генерирует QR, отправляет фото в чат бота, ждет сканирования,
+    запрашивает 2FA пароль при необходимости.
+    Возвращает авторизованный user_client.
     """
-    # Важно: используем отдельное имя файла сессии для userbot
-    user_client = TelegramClient(
-        os.path.join(DATA_DIR, "user_session"), cfg["api_id"], cfg["api_hash"]
-    )
+    user_client = TelegramClient(StringSession(), cfg["api_id"], cfg["api_hash"])
     await user_client.connect()
 
     if await user_client.is_user_authorized():
         return user_client
 
-    # Запрос кода у Telegram
-    try:
-        sent_code = await user_client.send_code_request(cfg["phone"])
-    except FloodWaitError as e:
-        await user_client.disconnect()
-        raise RuntimeError(
-            f"❌ Telegram требует подождать {e.seconds} сек. перед повторным запросом кода. "
-            f"Подождите и перезапустите бота."
-        )
+    await bot_client.send_message(cfg["your_id"], "🔄 Генерация QR-кода для входа...")
+    
+    # Генерируем QR-логин
+    qr_login = await user_client.qr_login()
 
-    # Попытка принудительной отправки SMS через ResendCodeRequest
-    try:
-        await user_client(ResendCodeRequest(cfg["phone"], sent_code.phone_code_hash))
-        print("[Auth] Запрошена повторная отправка кода (SMS).")
-    except Exception as e:
-        print(f"[Auth] ResendCodeRequest не удался: {e}")
+    # Создаем изображение QR-кода
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(qr_login.url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
 
-    # Очередь сообщений от вас боту
-    queue: asyncio.Queue = asyncio.Queue()
-
-    @bot_client.on(events.NewMessage(from_users=cfg["your_id"]))
-    async def _handler(event):
-        await queue.put(event.raw_text.strip())
-
-    code = await _wait_for_user_input(
-        queue,
-        "🔐 Требуется авторизация.\n\n"
-        "1. Проверьте **чат с официальным аккаунтом Telegram** в вашем приложении — "
-        "код чаще всего приходит именно туда, а не в SMS.\n"
-        "2. Если кода нет ни в приложении, ни в SMS, подождите минуту и попробуйте снова.\n\n"
-        "Отправьте код сюда сообщением.",
-        bot_client, cfg["your_id"],
+    # Отправляем фото через бота
+    await bot_client.send_file(
+        cfg["your_id"],
+        buf,
+        caption="📱 **Отсканируйте этот QR-код в Telegram:**\n"
+                "Настройки -> Устройства -> Подключить устройство\n\n"
+                "Ожидание сканирования (2 минуты)..."
     )
 
-    for attempt in range(1, 4):
+    try:
+        await qr_login.wait(timeout=120)
+    except SessionPasswordNeededError:
+        # Запрос пароля 2FA через бота
+        await bot_client.send_message(cfg["your_id"], "🔐 Введите пароль 2FA:")
+        
+        queue = asyncio.Queue()
+        @bot_client.on(events.NewMessage(from_users=cfg["your_id"]))
+        async def handler(event):
+            await queue.put(event.raw_text.strip())
+        
         try:
-            await user_client.sign_in(cfg["phone"], code)
-            break
-        except SessionPasswordNeededError:
-            password = await _wait_for_user_input(
-                queue,
-                "🔐 Включена двухфакторная аутентификация.\n"
-                "Отправьте пароль 2FA сообщением.",
-                bot_client, cfg["your_id"],
-            )
+            password = await asyncio.wait_for(queue.get(), timeout=120)
             await user_client.sign_in(password=password)
-            break
-        except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-            if attempt == 3:
-                await user_client.disconnect()
-                raise RuntimeError(f"❌ Не удалось войти: {e}")
-            code = await _wait_for_user_input(
-                queue,
-                f"❌ {e}. Попробуйте ещё раз ({attempt + 1}/3):",
-                bot_client, cfg["your_id"],
-            )
-        except Exception as e:
-            if attempt == 3:
-                await user_client.disconnect()
-                raise RuntimeError(f"❌ Ошибка авторизации: {e}")
-            code = await _wait_for_user_input(
-                queue,
-                f"❌ Ошибка: {e}. Попробуйте ещё раз ({attempt + 1}/3):",
-                bot_client, cfg["your_id"],
-            )
+        except asyncio.TimeoutError:
+            await user_client.disconnect()
+            raise RuntimeError("❌ Таймаут ввода пароля 2FA.")
+    except Exception as e:
+        await user_client.disconnect()
+        raise RuntimeError(f"❌ Ошибка QR-входа: {e}")
 
     if not await user_client.is_user_authorized():
         await user_client.disconnect()
         raise RuntimeError("❌ Авторизация не удалась.")
 
-    await bot_client.send_message(cfg["your_id"], "✅ Авторизация успешна!")
+    # Сохраняем сессию
+    session_string = user_client.session.save()
+    save_session_string(SESSION_FILE, session_string)
+    await bot_client.send_message(cfg["your_id"], "✅ Авторизация успешна! Сессия сохранена.")
     return user_client
-
 
 # ---------- ЛОГИКА ПАРСЕРА ----------
 async def search_public_channels(user_client, keywords):
@@ -210,7 +187,6 @@ async def search_public_channels(user_client, keywords):
         await asyncio.sleep(2)
     return list(found.values())
 
-
 async def check_channel_for_contests(user_client, channel):
     matches = []
     try:
@@ -225,10 +201,7 @@ async def check_channel_for_contests(user_client, channel):
                     "message_id": msg.id,
                     "message_text": msg.text[:400],
                     "date": msg.date,
-                    "link": (
-                        f"https://t.me/{channel.username}/{msg.id}"
-                        if channel.username else None
-                    ),
+                    "link": (f"https://t.me/{channel.username}/{msg.id}" if channel.username else None),
                 })
     except FloodWaitError as e:
         print(f"[FloodWait] {channel.title}: {e.seconds} сек.")
@@ -237,10 +210,8 @@ async def check_channel_for_contests(user_client, channel):
         print(f"[Ошибка чтения] {channel.title}: {e}")
     return matches
 
-
 async def send_alert(bot_client, your_id, matches):
-    if not matches:
-        return
+    if not matches: return
     by_channel = {}
     for m in matches:
         key = m["channel_username"] or m["channel_title"]
@@ -249,57 +220,42 @@ async def send_alert(bot_client, your_id, matches):
     for channel_key, msgs in by_channel.items():
         text = f"🎯 **Конкурсы в канале** {channel_key}\n\n"
         for m in msgs[:5]:
-            text += (
-                f"• [{m['date'].strftime('%d.%m %H:%M')}] "
-                f"{m['message_text'][:150]}...\n"
-            )
+            text += f"• [{m['date'].strftime('%d.%m %H:%M')}] {m['message_text'][:150]}...\n"
             if m["link"]:
                 text += f"  [Ссылка]({m['link']})\n"
         text += f"\nВсего совпадений: {len(msgs)}"
         try:
-            await bot_client.send_message(
-                your_id, text, parse_mode="md", link_preview=False
-            )
+            await bot_client.send_message(your_id, text, parse_mode="md", link_preview=False)
         except Exception as e:
             print(f"[Ошибка отправки] {e}")
         await asyncio.sleep(1)
-
 
 # ---------- MAIN ----------
 async def main():
     cfg = load_config()
     bot_token = read_bot_token(TOKEN_FILE)
 
-    # Бот для уведомлений (отдельный файл сессии)
-    bot_client = TelegramClient(
-        os.path.join(DATA_DIR, "bot_session"), cfg["api_id"], cfg["api_hash"]
-    )
+    # Бот для уведомлений и отправки QR
+    bot_client = TelegramClient(os.path.join(DATA_DIR, "bot_session"), cfg["api_id"], cfg["api_hash"])
     await bot_client.start(bot_token=bot_token)
-    print("✅ Бот для уведомлений авторизован.")
+    print("✅ Бот авторизован.")
 
-    # Userbot (отдельный файл сессии)
+    # Userbot
+    session_string = read_session_string(SESSION_FILE)
     user_client = None
-    try:
-        # Пытаемся подключиться с существующей сессией
-        user_client = TelegramClient(
-            os.path.join(DATA_DIR, "user_session"), cfg["api_id"], cfg["api_hash"]
-        )
+
+    if session_string:
+        print("✅ Используем сохранённую сессию.")
+        user_client = TelegramClient(StringSession(session_string), cfg["api_id"], cfg["api_hash"])
         await user_client.connect()
-        if await user_client.is_user_authorized():
-            print("✅ Userbot авторизован (сессия из файла).")
-        else:
-            print("⚠️ Сессия недействительна. Требуется авторизация.")
+        if not await user_client.is_user_authorized():
+            print("⚠️ Сессия недействительна. Запускаем QR-вход.")
             await user_client.disconnect()
             user_client = None
-    except Exception as e:
-        print(f"⚠️ Не удалось подключиться с существующей сессией: {e}")
-        if user_client:
-            await user_client.disconnect()
-        user_client = None
 
     if user_client is None:
-        print("⚠️ Запуск интерактивной авторизации через бота...")
-        user_client = await interactive_auth(cfg, bot_client)
+        print("⚠️ Запуск QR-авторизации...")
+        user_client = await qr_auth(cfg, bot_client)
 
     try:
         print("\n🔎 Этап 1: Поиск каналов...")
@@ -329,10 +285,8 @@ async def main():
         else:
             print("\n😔 Конкурсы не найдены.")
     finally:
-        # Корректное закрытие соединений
         await user_client.disconnect()
         await bot_client.disconnect()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
