@@ -31,14 +31,13 @@ SESSION_FILE = os.path.join(DATA_DIR, "session_string.txt")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
-# ---------- ДЕФОЛТНЫЕ НАСТРОЙКИ ----------
-MESSAGES_TO_CHECK = 100
-DELAY_BETWEEN_CHANNELS = 1.5
-DELAY_BETWEEN_PARTICIPATION = 3
+# ---------- НАСТРОЙКИ ----------
+MESSAGES_TO_CHECK = 50
+DELAY_BETWEEN_CHANNELS = 1.0
+DELAY_BETWEEN_PARTICIPATION = 2.0
 AUTO_SCAN_INTERVAL = 900
-MAX_CHANNELS_PER_PROFILE = 300
+MAX_CHANNELS_PER_PROFILE = 100
 
-# ---------- БАЗОВЫЕ КАНАЛЫ (ГАРАНТИРОВАННЫЙ ОХВАТ) ----------
 PRESET_CHANNELS = [
     "gtavi247", "cyberleekgtaviofficial", "gta6deluxe", "gta_6_play",
     "GTA6_m", "GTA6_6", "igropapka", "gta_6d", "gta_6k", "mir_gta6",
@@ -48,7 +47,6 @@ PRESET_CHANNELS = [
     "minecraft_news", "mcpe_hub", "minecraft_giveaway", "free_minecraft"
 ]
 
-# ---------- СЛОВАРИ МАРКЕРОВ ----------
 GIVEAWAY_MARKERS = [
     "розыгрыш", "разыгрываю", "разыгрываем", "разыграю", "разыграем",
     "конкурс", "приз", "выиграй", "выиграть", "выиграл", "giveaway",
@@ -290,7 +288,7 @@ async def try_participate(u_client, msg, channel_username: str, message_id: int)
         except Exception:
             pass
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
         msg = await u_client.get_messages(channel_username, ids=message_id)
         if not msg or not msg.buttons:
             return ("link_only", "Нет интерактивных кнопок")
@@ -308,7 +306,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
     global _scan_running, _stop_event
 
     if _scan_running and not debug:
-        await b_client.send_message(cfg["your_id"], "[!] Скан уже запущен.")
+        await b_client.send_message(cfg["your_id"], "[!] Скан уже запущен или завис. Нажмите «СБРОСИТЬ ЗАВИСАНИЕ» в меню.")
         return
 
     _scan_running = True
@@ -342,7 +340,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
         total_channels = 0
 
         if not auto_mode:
-            await b_client.send_message(cfg["your_id"], "[~] Запущен поиск розыгрышей...")
+            await b_client.send_message(cfg["your_id"], "[~] Запущен быстрый поиск розыгрышей...")
 
         for prof_name, data in profiles_to_run.items():
             if _stop_event.is_set():
@@ -351,25 +349,29 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
             channel_kw = data.get("channel_keywords", [])
             found_channels = {}
 
-            # 1. Сначала добавляем пресеты из базы гарантированных каналов
+            # Добавляем пресеты (с таймаутом на каждый)
             for uname in PRESET_CHANNELS:
+                if _stop_event.is_set():
+                    break
                 try:
-                    entity = await u_client.get_entity(uname)
+                    entity = await asyncio.wait_for(u_client.get_entity(uname), timeout=3.0)
                     if entity:
                         found_channels[entity.id] = entity
                 except Exception:
                     pass
 
-            # 2. Дополняем поиском через ключевые слова
+            # Поиск через ключевые слова
             for kw in channel_kw:
+                if _stop_event.is_set():
+                    break
                 try:
-                    result = await u_client(SearchRequest(q=kw, limit=50))
+                    result = await asyncio.wait_for(u_client(SearchRequest(q=kw, limit=30)), timeout=5.0)
                     for chat in result.chats:
                         if isinstance(chat, (Channel, Chat)) and getattr(chat, "username", None):
                             found_channels[chat.id] = chat
                 except Exception:
                     pass
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
 
             channels_list = list(found_channels.values())[:max_channels]
             total_channels += len(channels_list)
@@ -380,9 +382,14 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
 
                 ch_title = getattr(ch, "title", "") or ""
                 ch_username = getattr(ch, "username", "") or ""
+                if not ch_username:
+                    continue
 
                 try:
-                    messages = await u_client.get_messages(ch, limit=messages_to_check)
+                    messages = await asyncio.wait_for(
+                        u_client.get_messages(ch, limit=messages_to_check),
+                        timeout=8.0
+                    )
                 except Exception:
                     continue
 
@@ -453,7 +460,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                 await b_client.send_message(cfg["your_id"], text, parse_mode="html", link_preview=False)
             except Exception:
                 pass
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.3)
 
         if not auto_mode:
             await b_client.send_message(
@@ -463,6 +470,8 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                 f"Новых постов найдено: {len(new_posts)}",
                 parse_mode="html"
             )
+    except Exception as e:
+        await b_client.send_message(cfg["your_id"], f"[-] Ошибка выполнения скана: {str(e)[:100]}")
     finally:
         _scan_running = False
         if _stop_event:
@@ -484,6 +493,7 @@ def get_main_menu_buttons(cfg):
         [Button.inline("[>] ЗАПУСТИТЬ ПОИСК", data=b"run_all")],
         [Button.inline("[=] ПРОФИЛИ", data=b"select_run_profile")],
         [Button.inline(running_label, data=b"stop_scan")],
+        [Button.inline("[!] СБРОСИТЬ ЗАВИСАНИЕ", data=b"force_reset")],
         [Button.inline("[⚙] НАСТРОЙКИ", data=b"manage_profiles")],
         [Button.inline("[x] СБРОСИТЬ ИСТОРИЮ", data=b"clear_history")],
     ]
@@ -499,9 +509,19 @@ async def setup_bot_handlers(b_client):
             parse_mode="html",
         )
 
+    @b_client.on(events.NewMessage(pattern="/reset"))
+    async def reset_cmd(event):
+        global _scan_running, _stop_event
+        if event.sender_id != int(config_data["your_id"]):
+            return
+        _scan_running = False
+        if _stop_event:
+            _stop_event.set()
+        await event.respond("[+] Состояние принудительно сброшено. Зависания устранены.")
+
     @b_client.on(events.CallbackQuery)
     async def cb(event):
-        global config_data, user_client, _stop_event
+        global config_data, user_client, _scan_running, _stop_event
         if event.sender_id != int(config_data["your_id"]):
             return
 
@@ -521,6 +541,12 @@ async def setup_bot_handlers(b_client):
                 await event.answer("Остановка...", alert=True)
             else:
                 await event.answer("Скан не запущен", alert=True)
+        elif data == "force_reset":
+            _scan_running = False
+            if _stop_event:
+                _stop_event.set()
+            await event.answer("Зависание сброшено!", alert=True)
+            await event.edit("<b>[ГЛАВНОЕ МЕНЮ]</b>", buttons=get_main_menu_buttons(config_data), parse_mode="html")
         elif data == "clear_history":
             save_history({})
             await event.answer("История сброшена", alert=True)
