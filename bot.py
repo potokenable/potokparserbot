@@ -4,7 +4,7 @@ import os
 import re
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import Channel, Chat
@@ -87,7 +87,8 @@ def read_session_string(path: str) -> str:
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Файл сессии не найден: {path}\n"
-            f"Сгенерируйте строку сессии локально (см. инструкцию) и вставьте её в этот файл."
+            f"Сгенерируйте строку сессии локально (см. generate_session.py) "
+            f"и вставьте её в этот файл."
         )
     with open(path, "r", encoding="utf-8") as f:
         session = f.read().strip()
@@ -190,25 +191,28 @@ async def main():
     bot_token = read_bot_token(TOKEN_FILE)
     session_string = read_session_string(SESSION_FILE)
 
-    # Userbot на StringSession — не требует интерактивного ввода кода
+    # Userbot на StringSession — НЕ вызывает start(phone=...), не шлёт код
     user_client = TelegramClient(
         StringSession(session_string), cfg["api_id"], cfg["api_hash"]
     )
 
-    # Бот для отправки уведомлений (тоже StringSession не нужен — токен сам авторизует)
+    # Бот для уведомлений авторизуется токеном — код не нужен
     bot_client = TelegramClient(
         os.path.join(DATA_DIR, "bot_session"), cfg["api_id"], cfg["api_hash"]
     )
 
     print("🚀 Запуск парсера...")
 
+    # Подключаемся БЕЗ start(phone=...) — только connect + проверка
     await user_client.connect()
     if not await user_client.is_user_authorized():
+        await user_client.disconnect()
         raise RuntimeError(
-            "Сессия userbot недействительна. Сгенерируйте строку сессии заново "
-            "локально и обновите data/session_string.txt."
+            "❌ Сессия userbot недействительна.\n"
+            "Сгенерируйте строку сессии заново через generate_session.py локально "
+            "и обновите data/session_string.txt."
         )
-    print("✅ Userbot авторизован (StringSession).")
+    print("✅ Userbot авторизован (StringSession, без запроса кода).")
 
     await bot_client.start(bot_token=bot_token)
     print("✅ Бот для уведомлений авторизован.")
