@@ -41,7 +41,6 @@ CONTEST_KEYWORDS = [
 
 MESSAGES_TO_CHECK = 50
 DELAY_BETWEEN_CHANNELS = 3
-AUTH_TIMEOUT = 600
 
 # ---------- ФАЙЛЫ ----------
 def ensure_data_dir():
@@ -100,13 +99,10 @@ def contains_keywords(text: str, keywords) -> bool:
     norm = normalize_text(text)
     return any(normalize_text(kw) in norm for kw in keywords)
 
-# ---------- QR-АВТОРИЗАЦИЯ (ВСЁ НА ХОСТИНГЕ) ----------
+# ---------- QR-АВТОРИЗАЦИЯ ----------
 async def qr_auth(cfg: dict, bot_client):
     """
-    Авторизация через QR-код.
-    Генерирует QR, отправляет фото в чат бота, ждет сканирования,
-    запрашивает 2FA пароль при необходимости.
-    Возвращает авторизованный user_client.
+    Авторизация через QR-код с надежным перехватом 2FA-пароля через бота.
     """
     user_client = TelegramClient(StringSession(), cfg["api_id"], cfg["api_hash"])
     await user_client.connect()
@@ -140,13 +136,17 @@ async def qr_auth(cfg: dict, bot_client):
     try:
         await qr_login.wait(timeout=120)
     except SessionPasswordNeededError:
-        # Запрос пароля 2FA через бота
-        await bot_client.send_message(cfg["your_id"], "🔐 Введите пароль 2FA:")
+        await bot_client.send_message(cfg["your_id"], "🔐 Обнаружена защита 2FA. Введите ваш пароль облачного пароля в ответном сообщении:")
         
         queue = asyncio.Queue()
-        @bot_client.on(events.NewMessage(from_users=cfg["your_id"]))
-        async def handler(event):
-            await queue.put(event.raw_text.strip())
+
+        # Функция-обработчик для получения 2FA пароля из чата с ботом
+        async def password_handler(event):
+            if event.sender_id == int(cfg["your_id"]):
+                await queue.put(event.raw_text.strip())
+
+        # Добавляем обработчик событий
+        bot_client.add_event_handler(password_handler, events.NewMessage(from_users=cfg["your_id"]))
         
         try:
             password = await asyncio.wait_for(queue.get(), timeout=120)
@@ -154,6 +154,10 @@ async def qr_auth(cfg: dict, bot_client):
         except asyncio.TimeoutError:
             await user_client.disconnect()
             raise RuntimeError("❌ Таймаут ввода пароля 2FA.")
+        finally:
+            # Обязательно удаляем обработчик, чтобы он не висел дальше
+            bot_client.remove_event_handler(password_handler)
+            
     except Exception as e:
         await user_client.disconnect()
         raise RuntimeError(f"❌ Ошибка QR-входа: {e}")
@@ -218,7 +222,7 @@ async def send_alert(bot_client, your_id, matches):
         by_channel.setdefault(key, []).append(m)
 
     for channel_key, msgs in by_channel.items():
-        text = f"🎯 **Конкурсы в канале** {channel_key}\n\n"
+        text = f"🎯 **Конкурсы в канале** @{channel_key}\n\n"
         for m in msgs[:5]:
             text += f"• [{m['date'].strftime('%d.%m %H:%M')}] {m['message_text'][:150]}...\n"
             if m["link"]:
