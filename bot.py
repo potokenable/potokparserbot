@@ -33,10 +33,20 @@ STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
 # ---------- ДЕФОЛТНЫЕ НАСТРОЙКИ ----------
 MESSAGES_TO_CHECK = 100
-DELAY_BETWEEN_CHANNELS = 2
-DELAY_BETWEEN_PARTICIPATION = 4
+DELAY_BETWEEN_CHANNELS = 1.5
+DELAY_BETWEEN_PARTICIPATION = 3
 AUTO_SCAN_INTERVAL = 900
-MAX_CHANNELS_PER_PROFILE = 150
+MAX_CHANNELS_PER_PROFILE = 300
+
+# ---------- БАЗОВЫЕ КАНАЛЫ (ГАРАНТИРОВАННЫЙ ОХВАТ) ----------
+PRESET_CHANNELS = [
+    "gtavi247", "cyberleekgtaviofficial", "gta6deluxe", "gta_6_play",
+    "GTA6_m", "GTA6_6", "igropapka", "gta_6d", "gta_6k", "mir_gta6",
+    "gta6side", "gta6_dailyy", "GrandTheftAuto6_ru", "gta6blog",
+    "gta6main", "gta6princ", "ru_gtavi", "psforgta", "gta6news",
+    "gtanews", "rockstar_hub", "gta6_leaks", "gta6_community",
+    "minecraft_news", "mcpe_hub", "minecraft_giveaway", "free_minecraft"
+]
 
 # ---------- СЛОВАРИ МАРКЕРОВ ----------
 GIVEAWAY_MARKERS = [
@@ -198,11 +208,9 @@ def is_relevant_post(msg, profile: dict, ch_title: str = "", ch_username: str = 
     contest_kw = profile.get("contest_keywords", GIVEAWAY_MARKERS)
     topic_kw = profile.get("topic_keywords", [])
 
-    # Обязательно наличие маркера розыгрыша
     if not contains_any(text, contest_kw):
         return False
 
-    # Если заданы ключевые слова темы, проверяем мягко (в тексте ИЛИ в названии канала)
     if topic_kw:
         in_text = contains_any(text, topic_kw)
         in_channel = contains_any(ch_title, topic_kw) or contains_any(ch_username, topic_kw)
@@ -238,7 +246,7 @@ async def qr_auth(cfg: dict, b_client):
     if await u_client.is_user_authorized():
         return u_client
 
-    await b_client.send_message(cfg["your_id"], "🔄 Генерация QR-кода...")
+    await b_client.send_message(cfg["your_id"], "[QR] Генерация кода...")
     qr_login = await u_client.qr_login()
 
     qr = qrcode.QRCode(border=1)
@@ -249,15 +257,15 @@ async def qr_auth(cfg: dict, b_client):
     img.save(buf, format="PNG")
     buf.seek(0)
 
-    await b_client.send_file(cfg["your_id"], buf, caption="📱 Отсканируйте QR-код в Telegram.")
+    await b_client.send_file(cfg["your_id"], buf, caption="[QR] Отсканируйте код в Telegram.")
 
     try:
         await qr_login.wait(timeout=300)
     except asyncio.TimeoutError:
         await u_client.disconnect()
-        raise RuntimeError("❌ Таймаут QR-входа.")
+        raise RuntimeError("[-] Таймаут QR-входа.")
     except SessionPasswordNeededError:
-        await b_client.send_message(cfg["your_id"], "🔐 Введите 2FA пароль:")
+        await b_client.send_message(cfg["your_id"], "[2FA] Введите облачный пароль:")
         queue = asyncio.Queue()
 
         @b_client.on(events.NewMessage(from_users=cfg["your_id"]))
@@ -271,7 +279,7 @@ async def qr_auth(cfg: dict, b_client):
             b_client.remove_event_handler(password_handler)
             
     save_session_string(SESSION_FILE, u_client.session.save())
-    await b_client.send_message(cfg["your_id"], "✅ Авторизация успешна!")
+    await b_client.send_message(cfg["your_id"], "[+] Авторизация успешна.")
     return u_client
 
 async def try_participate(u_client, msg, channel_username: str, message_id: int):
@@ -289,7 +297,7 @@ async def try_participate(u_client, msg, channel_username: str, message_id: int)
 
         btn = find_participate_button(msg) or find_subscribe_button(msg)
         if btn is None or getattr(btn, "url", None):
-            return ("link_only", "Интерактивная кнопка не найдена")
+            return ("link_only", "Кнопка не найдена")
 
         await btn.click()
         return ("participated", "OK")
@@ -300,7 +308,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
     global _scan_running, _stop_event
 
     if _scan_running and not debug:
-        await b_client.send_message(cfg["your_id"], "⚠️ Скан уже запущен.")
+        await b_client.send_message(cfg["your_id"], "[!] Скан уже запущен.")
         return
 
     _scan_running = True
@@ -334,7 +342,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
         total_channels = 0
 
         if not auto_mode:
-            await b_client.send_message(cfg["your_id"], "🚀 Поиск розыгрышей запущен...")
+            await b_client.send_message(cfg["your_id"], "[~] Запущен поиск розыгрышей...")
 
         for prof_name, data in profiles_to_run.items():
             if _stop_event.is_set():
@@ -343,15 +351,25 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
             channel_kw = data.get("channel_keywords", [])
             found_channels = {}
 
+            # 1. Сначала добавляем пресеты из базы гарантированных каналов
+            for uname in PRESET_CHANNELS:
+                try:
+                    entity = await u_client.get_entity(uname)
+                    if entity:
+                        found_channels[entity.id] = entity
+                except Exception:
+                    pass
+
+            # 2. Дополняем поиском через ключевые слова
             for kw in channel_kw:
                 try:
-                    result = await u_client(SearchRequest(q=kw, limit=30))
+                    result = await u_client(SearchRequest(q=kw, limit=50))
                     for chat in result.chats:
                         if isinstance(chat, (Channel, Chat)) and getattr(chat, "username", None):
                             found_channels[chat.id] = chat
                 except Exception:
                     pass
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
 
             channels_list = list(found_channels.values())[:max_channels]
             total_channels += len(channels_list)
@@ -393,7 +411,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                             participated_this_run += 1
                         await asyncio.sleep(DELAY_BETWEEN_PARTICIPATION)
                     else:
-                        status, detail = "link_only", "Достигнут лимит"
+                        status, detail = "link_only", "Лимит исчерпан"
 
                     history[uid] = {
                         "status": status,
@@ -419,30 +437,30 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
         save_state(state)
 
         for p in new_posts:
-            emoji, header = {
-                "participated": ("✅", "УЧАСТИЕ ПРИНЯТО"),
-                "link_only": ("🔗", "НАЙДЕН РОЗЫГРЫШ"),
-                "failed": ("⚠️", "ОШИБКА"),
-            }.get(p["status"], ("❓", "?"))
+            marker = {
+                "participated": "[+] УЧАСТИЕ",
+                "link_only": "[•] РОЗЫГРЫШ",
+                "failed": "[-] ОШИБКА",
+            }.get(p["status"], "[?]")
 
             text = (
-                f"{emoji} <b>{header}</b>\n"
-                f"📂 {p['profile']} | 📢 {p['channel']}\n\n"
-                f"📝 {p['text'][:300]}...\n\n"
-                f"🔗 <a href=\"{p['link']}\">Перейти к посту</a>"
+                f"<b>{marker}</b>\n"
+                f"[{p['profile']}] @{p['channel']}\n\n"
+                f"{p['text'][:300]}...\n\n"
+                f"<a href=\"{p['link']}\">Перейти к посту</a>"
             )
             try:
                 await b_client.send_message(cfg["your_id"], text, parse_mode="html", link_preview=False)
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
 
         if not auto_mode:
             await b_client.send_message(
                 cfg["your_id"],
-                f"🏁 <b>Поиск завершен!</b>\n"
-                f"📡 Каналов: {total_channels}\n"
-                f"📥 Найдено новых постов: {len(new_posts)}",
+                f"<b>[#] ПОИСК ЗАВЕРШЕН</b>\n"
+                f"Каналов проверено: {total_channels}\n"
+                f"Новых постов найдено: {len(new_posts)}",
                 parse_mode="html"
             )
     finally:
@@ -461,13 +479,13 @@ async def periodic_scanner(b_client, u_client, cfg, interval: int):
         await asyncio.sleep(interval)
 
 def get_main_menu_buttons(cfg):
-    running_label = "⏹ Стоп (идёт скан)" if _scan_running else "⏹ Стоп"
+    running_label = "[■] СТОП (идёт скан)" if _scan_running else "[■] СТОП"
     return [
-        [Button.inline("🚀 Запустить весь поиск", data=b"run_all")],
-        [Button.inline("📂 Профиль для поиска", data=b"select_run_profile")],
+        [Button.inline("[>] ЗАПУСТИТЬ ПОИСК", data=b"run_all")],
+        [Button.inline("[=] ПРОФИЛИ", data=b"select_run_profile")],
         [Button.inline(running_label, data=b"stop_scan")],
-        [Button.inline("⚙️ Управление профилями", data=b"manage_profiles")],
-        [Button.inline("🗑 Сбросить историю", data=b"clear_history")],
+        [Button.inline("[⚙] НАСТРОЙКИ", data=b"manage_profiles")],
+        [Button.inline("[x] СБРОСИТЬ ИСТОРИЮ", data=b"clear_history")],
     ]
 
 async def setup_bot_handlers(b_client):
@@ -476,7 +494,7 @@ async def setup_bot_handlers(b_client):
         if event.sender_id != int(config_data["your_id"]):
             return
         await event.respond(
-            "🤖 <b>Панель парсера розыгрышей</b>\n\nВыберите действие:",
+            "<b>[ПАНЕЛЬ УПРАВЛЕНИЯ]</b>\n\nВыберите действие:",
             buttons=get_main_menu_buttons(config_data),
             parse_mode="html",
         )
@@ -490,23 +508,23 @@ async def setup_bot_handlers(b_client):
         data = event.data.decode("utf-8")
 
         if data == "main_menu":
-            await event.edit("🤖 <b>Главное меню</b>", buttons=get_main_menu_buttons(config_data), parse_mode="html")
+            await event.edit("<b>[ГЛАВНОЕ МЕНЮ]</b>", buttons=get_main_menu_buttons(config_data), parse_mode="html")
         elif data == "run_all":
             if _scan_running:
-                await event.answer("⚠️ Скан уже идёт!", alert=True)
+                await event.answer("Скан уже идёт", alert=True)
                 return
-            await event.edit("⏳ Запуск поиска...")
+            await event.edit("[~] Запуск...")
             asyncio.create_task(run_parser_task(b_client, user_client, config_data))
         elif data == "stop_scan":
             if _scan_running and _stop_event and not _stop_event.is_set():
                 _stop_event.set()
-                await event.answer("⏹ Останавливаю...", alert=True)
+                await event.answer("Остановка...", alert=True)
             else:
-                await event.answer("ℹ️ Скан не запущен", alert=True)
+                await event.answer("Скан не запущен", alert=True)
         elif data == "clear_history":
             save_history({})
-            await event.answer("🗑 История сброшена!", alert=True)
-            await event.edit("🤖 <b>Главное меню</b>", buttons=get_main_menu_buttons(config_data), parse_mode="html")
+            await event.answer("История сброшена", alert=True)
+            await event.edit("<b>[ГЛАВНОЕ МЕНЮ]</b>", buttons=get_main_menu_buttons(config_data), parse_mode="html")
 
 async def main():
     global bot_client, user_client, config_data
@@ -515,7 +533,7 @@ async def main():
 
     bot_client = TelegramClient(os.path.join(DATA_DIR, "bot_session"), config_data["api_id"], config_data["api_hash"])
     await bot_client.start(bot_token=bot_token)
-    print("✅ Бот запущен.")
+    print("[+] Бот запущен.")
 
     await setup_bot_handlers(bot_client)
 
