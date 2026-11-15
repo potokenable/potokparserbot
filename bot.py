@@ -5,6 +5,7 @@ import re
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import Channel, Chat
 
@@ -12,12 +13,12 @@ from telethon.tl.types import Channel, Chat
 DATA_DIR = "data"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TOKEN_FILE = os.path.join(DATA_DIR, "token.txt")
+SESSION_FILE = os.path.join(DATA_DIR, "session_string.txt")
 
 # ---------- ЗНАЧЕНИЯ ПО УМОЛЧАНИЮ (используются, если в config.json пусто) ----------
 DEFAULT_CONFIG = {
     "api_id": 0,               # <-- ваш api_id (int) с my.telegram.org
     "api_hash": "",            # <-- ваш api_hash (str)
-    "phone": "",               # <-- ваш номер в формате +7999...
     "your_id": 0,              # <-- ваш telegram user_id (int)
 }
 
@@ -51,13 +52,13 @@ def load_config():
             json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
         raise FileNotFoundError(
             f"Файл {CONFIG_FILE} не найден — создан шаблон.\n"
-            f"Заполните поля api_id, api_hash, phone, your_id и запустите снова."
+            f"Заполните поля api_id, api_hash, your_id и запустите снова."
         )
 
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
-    missing = [k for k in ("api_id", "api_hash", "phone", "your_id") if not cfg.get(k)]
+    missing = [k for k in ("api_id", "api_hash", "your_id") if not cfg.get(k)]
     if missing:
         raise ValueError(
             f"В {CONFIG_FILE} не заполнены поля: {', '.join(missing)}"
@@ -78,6 +79,21 @@ def read_bot_token(path: str) -> str:
     if not token:
         raise ValueError(f"Файл {path} пустой. Вставьте в него токен бота.")
     return token
+
+
+def read_session_string(path: str) -> str:
+    """Читает строку сессии userbot из data/session_string.txt."""
+    ensure_data_dir()
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Файл сессии не найден: {path}\n"
+            f"Сгенерируйте строку сессии локально (см. инструкцию) и вставьте её в этот файл."
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        session = f.read().strip()
+    if not session:
+        raise ValueError(f"Файл {path} пустой. Вставьте в него строку сессии.")
+    return session
 
 
 # ---------- УТИЛИТЫ ----------
@@ -172,21 +188,27 @@ async def send_alert(bot_client, your_id, matches):
 async def main():
     cfg = load_config()
     bot_token = read_bot_token(TOKEN_FILE)
+    session_string = read_session_string(SESSION_FILE)
 
+    # Userbot на StringSession — не требует интерактивного ввода кода
     user_client = TelegramClient(
-        os.path.join(DATA_DIR, "parser_session"), cfg["api_id"], cfg["api_hash"]
+        StringSession(session_string), cfg["api_id"], cfg["api_hash"]
     )
+
+    # Бот для отправки уведомлений (тоже StringSession не нужен — токен сам авторизует)
     bot_client = TelegramClient(
         os.path.join(DATA_DIR, "bot_session"), cfg["api_id"], cfg["api_hash"]
     )
 
     print("🚀 Запуск парсера...")
-    try:
-        await user_client.start(phone=cfg["phone"])
-    except SessionPasswordNeededError:
-        pwd = input("Введите пароль двухфакторной аутентификации: ")
-        await user_client.sign_in(password=pwd)
-    print("✅ Userbot авторизован.")
+
+    await user_client.connect()
+    if not await user_client.is_user_authorized():
+        raise RuntimeError(
+            "Сессия userbot недействительна. Сгенерируйте строку сессии заново "
+            "локально и обновите data/session_string.txt."
+        )
+    print("✅ Userbot авторизован (StringSession).")
 
     await bot_client.start(bot_token=bot_token)
     print("✅ Бот для уведомлений авторизован.")
