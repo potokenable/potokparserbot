@@ -41,9 +41,9 @@ DEFAULT_CONFIG = {
 }
 
 MESSAGES_TO_CHECK = 50
-DELAY_BETWEEN_CHANNELS = 3
+DELAY_BETWEEN_CHANNELS = 2
 
-# Глобальные переменные для клиентов
+# Глобальные переменные
 bot_client = None
 user_client = None
 config_data = DEFAULT_CONFIG
@@ -52,17 +52,13 @@ config_data = DEFAULT_CONFIG
 def ensure_data_dir():
     if not os.path.isdir(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
-        print(f"[+] Создана папка {DATA_DIR}/")
 
 def load_config() -> dict:
     ensure_data_dir()
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
-        raise FileNotFoundError(
-            f"Создан шаблон {CONFIG_FILE}. Заполните api_id, api_hash, your_id "
-            f"и перезапустите скрипт."
-        )
+        raise FileNotFoundError(f"Создан шаблон {CONFIG_FILE}. Заполните api_id, api_hash, your_id.")
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     
@@ -98,7 +94,7 @@ def save_history(history: list):
 def read_bot_token(path: str) -> str:
     ensure_data_dir()
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Файл с токеном не найден: {path}. Вставьте токен от @BotFather.")
+        raise FileNotFoundError(f"Файл с токеном не найден: {path}.")
     with open(path, "r", encoding="utf-8") as f:
         token = f.read().strip()
     if not token:
@@ -150,46 +146,31 @@ async def qr_auth(cfg: dict, b_client):
         cfg["your_id"],
         buf,
         caption="📱 **Отсканируйте этот QR-код в Telegram:**\n"
-                "Настройки -> Устройства -> Подключить устройство\n\n"
-                "⏳ Ожидание сканирования (5 минут)..."
+                "Настройки -> Устройства -> Подключить устройство"
     )
 
     try:
         await qr_login.wait(timeout=300)
     except asyncio.TimeoutError:
         await u_client.disconnect()
-        await b_client.send_message(cfg["your_id"], "❌ Время ожидания QR-кода истекло.")
         raise RuntimeError("❌ Таймаут QR-входа.")
     except SessionPasswordNeededError:
         await b_client.send_message(cfg["your_id"], "🔐 **Требуется 2FA!** Введите ваш облачный пароль:")
         queue = asyncio.Queue()
 
+        @b_client.on(events.NewMessage(from_users=cfg["your_id"]))
         async def password_handler(event):
-            if event.sender_id == int(cfg["your_id"]):
-                await queue.put(event.raw_text.strip())
+            await queue.put(event.raw_text.strip())
 
-        b_client.add_event_handler(password_handler, events.NewMessage(from_users=cfg["your_id"]))
         try:
-            for attempt in range(3):
-                password = await asyncio.wait_for(queue.get(), timeout=120)
-                try:
-                    await u_client.sign_in(password=password)
-                    break
-                except PasswordHashInvalidError:
-                    if attempt < 2:
-                        await b_client.send_message(cfg["your_id"], "❌ Неверный пароль! Попробуйте снова:")
-                    else:
-                        raise RuntimeError("❌ Превышено число попыток 2FA.")
+            password = await asyncio.wait_for(queue.get(), timeout=120)
+            await u_client.sign_in(password=password)
         finally:
             b_client.remove_event_handler(password_handler)
             
     except Exception as e:
         await u_client.disconnect()
         raise RuntimeError(f"❌ Ошибка QR-входа: {e}")
-
-    if not await u_client.is_user_authorized():
-        await u_client.disconnect()
-        raise RuntimeError("❌ Авторизация не удалась.")
 
     session_string = u_client.session.save()
     save_session_string(SESSION_FILE, session_string)
@@ -235,7 +216,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None):
             await asyncio.sleep(1)
 
         channels_list = list(found_channels.values())
-        await b_client.send_message(cfg["your_id"], f"📌 Найдено каналов: {len(channels_list)}. Проверяем посты...")
+        await b_client.send_message(cfg["your_id"], f"📌 Найдено каналов для `{prof_name}`: {len(channels_list)}. Проверяем посты...")
 
         all_matches = []
         for ch in channels_list:
@@ -245,11 +226,9 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None):
                     if not msg.text:
                         continue
                     
-                    # Формируем уникальный идентификатор поста для проверки дубликатов
                     chan_username = ch.username or str(ch.id)
                     post_uid = f"{chan_username}:{msg.id}"
 
-                    # Проверяем ключевые слова и историю
                     if post_uid not in history and contains_keywords(msg.text, contest_kw):
                         all_matches.append({
                             "uid": post_uid,
@@ -264,7 +243,6 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None):
                 pass
             await asyncio.sleep(DELAY_BETWEEN_CHANNELS)
 
-        # Отправка результатов
         if all_matches:
             by_channel = {}
             for m in all_matches:
@@ -278,7 +256,6 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None):
                     if m["link"]:
                         text += f"  [Ссылка]({m['link']})\n"
                     
-                    # Добавляем в историю, чтобы больше никогда не отправлять
                     if m["uid"] not in history:
                         history.append(m["uid"])
                         new_posts_found += 1
@@ -291,22 +268,19 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None):
         else:
             await b_client.send_message(cfg["your_id"], f"😔 В профиле `{prof_name}` новых уникальных розыгрышей нет.")
 
-    # Сохраняем обновленную историю
     save_history(history)
-    await b_client.send_message(cfg["your_id"], f"🏁 Поиск завершен! Новых отправленных постов: {new_posts_found}")
+    await b_client.send_message(cfg["your_id"], f"🏁 Поиск завершен! Новых уникальных постов отправлено: {new_posts_found}")
 
-# ---------- ИНТЕРАКТИВНОЕ МЕНЮ БОТА (ГЛОБАЛЬНЫЕ ХЕНДЛЕРЫ) ----------
+# ---------- ИНТЕРАКТИВНОЕ МЕНЮ БОТА ----------
 def get_main_menu_buttons(cfg):
-    buttons = [
+    return [
         [Button.inline("🚀 Запустить весь поиск", data=b"run_all")],
         [Button.inline("📂 Выбрать профиль для поиска", data=b"select_run_profile")],
         [Button.inline("⚙️ Управление профилями", data=b"manage_profiles")],
         [Button.inline("➕ Добавить новый профиль", data=b"add_profile")],
         [Button.inline("🗑 Сбросить историю отправленных", data=b"clear_history")]
     ]
-    return buttons
 
-# Глобальный обработчик /start
 async def setup_bot_handlers(b_client):
     @b_client.on(events.NewMessage(pattern="/start"))
     async def start_cmd(event):
@@ -331,7 +305,7 @@ async def setup_bot_handlers(b_client):
             await event.edit("🤖 **Главное меню:**", buttons=get_main_menu_buttons(config_data))
 
         elif data == "run_all":
-            await event.edit("⏳ Запускаю поиск по всем профилям...")
+            await event.edit("⏳ Поиск запущен в фоновом режиме. Вы можете продолжать пользоваться меню.")
             asyncio.create_task(run_parser_task(b_client, user_client, config_data))
 
         elif data == "select_run_profile":
@@ -345,7 +319,7 @@ async def setup_bot_handlers(b_client):
 
         elif data.startswith("run_p_"):
             p_name = data.replace("run_p_", "")
-            await event.edit(f"⏳ Запускаю поиск для профиля: **{p_name}**...")
+            await event.edit(f"⏳ Поиск для профиля **{p_name}** запущен в фоновом режиме.")
             asyncio.create_task(run_parser_task(b_client, user_client, config_data, profile_name=p_name))
 
         elif data == "manage_profiles":
@@ -380,17 +354,13 @@ async def setup_bot_handlers(b_client):
             is_channels = data.startswith("set_chk_")
             p_name = data.replace("set_chk_" if is_channels else "set_cok_", "")
             
-            await event.edit(
-                f"✍️ Введите новые ключевые слова для профиля **{p_name}** "
-                f"({'каналов' if is_channels else 'конкурсов'}), через запятую:"
-            )
+            await event.edit(f"✍️ Введите новые ключевые слова для профиля **{p_name}** через запятую:")
             
             queue = asyncio.Queue()
             @b_client.on(events.NewMessage(from_users=config_data["your_id"]))
             async def input_handler(e):
                 await queue.put(e.raw_text.strip())
 
-            b_client.add_event_handler(input_handler, events.NewMessage(from_users=config_data["your_id"]))
             try:
                 new_text = await asyncio.wait_for(queue.get(), timeout=60)
                 kw_list = [k.strip() for k in new_text.split(",") if k.strip()]
@@ -401,7 +371,7 @@ async def setup_bot_handlers(b_client):
                     config_data["profiles"][p_name]["contest_keywords"] = kw_list
                 
                 save_config(config_data)
-                await b_client.send_message(config_data["your_id"], f"✅ Успешно обновлено для `{p_name}`!", buttons=get_main_menu_buttons(config_data))
+                await b_client.send_message(config_data["your_id"], f"✅ Успешно обновлено!", buttons=get_main_menu_buttons(config_data))
             except asyncio.TimeoutError:
                 await b_client.send_message(config_data["your_id"], "❌ Время ввода истекло.", buttons=get_main_menu_buttons(config_data))
             finally:
@@ -415,14 +385,13 @@ async def setup_bot_handlers(b_client):
             await event.edit(f"🗑 Профиль **{p_name}** удален.", buttons=get_main_menu_buttons(config_data))
 
         elif data == "add_profile":
-            await event.edit("➕ Введите название нового профиля (например: `CS2`, `NFT`):")
+            await event.edit("➕ Введите название нового профиля (например: `CS2`):")
             queue = asyncio.Queue()
 
             @b_client.on(events.NewMessage(from_users=config_data["your_id"]))
             async def name_handler(e):
                 await queue.put(e.raw_text.strip())
 
-            b_client.add_event_handler(name_handler, events.NewMessage(from_users=config_data["your_id"]))
             try:
                 p_name = await asyncio.wait_for(queue.get(), timeout=60)
                 if p_name in config_data["profiles"]:
@@ -434,12 +403,7 @@ async def setup_bot_handlers(b_client):
                     "contest_keywords": ["конкурс", "розыгрыш", "приз", "giveaway"]
                 }
                 save_config(config_data)
-                await b_client.send_message(
-                    config_data["your_id"], 
-                    f"✅ Профиль **{p_name}** создан!\n"
-                    f"Настройте ключевые слова через меню управления.", 
-                    buttons=get_main_menu_buttons(config_data)
-                )
+                await b_client.send_message(config_data["your_id"], f"✅ Профиль **{p_name}** создан!", buttons=get_main_menu_buttons(config_data))
             except asyncio.TimeoutError:
                 await b_client.send_message(config_data["your_id"], "❌ Время ввода истекло.", buttons=get_main_menu_buttons(config_data))
             finally:
@@ -447,7 +411,7 @@ async def setup_bot_handlers(b_client):
 
         elif data == "clear_history":
             save_history([])
-            await event.answer("🗑 История отправленных постов очищена!", alert=True)
+            await event.answer("🗑 История сброшена!", alert=True)
             await event.edit("🤖 **Главное меню:**", buttons=get_main_menu_buttons(config_data))
 
 # ---------- MAIN ----------
@@ -460,27 +424,22 @@ async def main():
     await bot_client.start(bot_token=bot_token)
     print("✅ Бот запущен.")
 
-    # Регистрируем хендлеры
     await setup_bot_handlers(bot_client)
 
     session_string = read_session_string(SESSION_FILE)
     user_client = None
 
     if session_string:
-        print("✅ Используем сохранённую сессию юзербота.")
         user_client = TelegramClient(StringSession(session_string), config_data["api_id"], config_data["api_hash"])
         await user_client.connect()
         if not await user_client.is_user_authorized():
-            print("⚠️ Сессия недействительна. Запускаем QR-вход.")
             await user_client.disconnect()
             user_client = None
 
     if user_client is None:
-        print("⚠️ Запуск QR-авторизации...")
         user_client = await qr_auth(config_data, bot_client)
 
-    print("🟢 Всё готово! Перейдите в Telegram в чат с вашим ботом и отправьте команду /start")
-    
+    print("🟢 Бот полностью активен. Напишите /start вашему боту в Telegram.")
     await bot_client.run_until_disconnected()
 
 if __name__ == "__main__":
