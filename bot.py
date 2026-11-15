@@ -9,6 +9,7 @@ from telethon import TelegramClient, events
 from telethon.errors import (
     FloodWaitError,
     SessionPasswordNeededError,
+    PasswordHashInvalidError,
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import SearchRequest
@@ -131,10 +132,14 @@ async def qr_auth(cfg: dict, bot_client):
         await qr_login.wait(timeout=300)
     except asyncio.TimeoutError:
         await user_client.disconnect()
-        await bot_client.send_message(cfg["your_id"], "❌ Время ожидания сканирования QR-кода истекло (5 минут). Перезапустите скрипт.")
+        await bot_client.send_message(cfg["your_id"], "❌ Время ожидания сканирования QR-кода истекло (5 минут).")
         raise RuntimeError("❌ Время ожидания сканирования QR-кода истекло.")
     except SessionPasswordNeededError:
-        await bot_client.send_message(cfg["your_id"], "🔐 Обнаружена защита 2FA. Введите ваш облачный пароль в ответном сообщении:")
+        await bot_client.send_message(
+            cfg["your_id"], 
+            "🔐 **Требуется 2FA!** Обнаружен облачный пароль.\n"
+            "Введите ваш пароль в следующем сообщении:"
+        )
         
         queue = asyncio.Queue()
 
@@ -145,8 +150,17 @@ async def qr_auth(cfg: dict, bot_client):
         bot_client.add_event_handler(password_handler, events.NewMessage(from_users=cfg["your_id"]))
         
         try:
-            password = await asyncio.wait_for(queue.get(), timeout=120)
-            await user_client.sign_in(password=password)
+            # Даем 3 попытки на ввод правильного пароля
+            for attempt in range(3):
+                password = await asyncio.wait_for(queue.get(), timeout=120)
+                try:
+                    await user_client.sign_in(password=password)
+                    break
+                except PasswordHashInvalidError:
+                    if attempt < 2:
+                        await bot_client.send_message(cfg["your_id"], "❌ Неверный пароль! Попробуйте еще раз:")
+                    else:
+                        raise RuntimeError("❌ Превышено количество попыток ввода 2FA пароля.")
         except asyncio.TimeoutError:
             await user_client.disconnect()
             raise RuntimeError("❌ Таймаут ввода пароля 2FA.")
