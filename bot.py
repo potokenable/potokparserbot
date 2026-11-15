@@ -12,20 +12,20 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import SearchRequest
+from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.types import Channel, Chat
 
 # ---------- ПУТИ ----------
 DATA_DIR = "data"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TOKEN_FILE = os.path.join(DATA_DIR, "token.txt")
-SESSION_FILE = os.path.join(DATA_DIR, "session_string.txt")
 
 # ---------- КОНФИГ ПО УМОЛЧАНИЮ ----------
 DEFAULT_CONFIG = {
-    "api_id": 0,           # int с my.telegram.org
-    "api_hash": "",        # str с my.telegram.org
-    "phone": "",           # ваш номер, например "+79990000000"
-    "your_id": 0,          # ваш Telegram user_id (int), для уведомлений и авторизации
+    "api_id": 0,
+    "api_hash": "",
+    "phone": "",
+    "your_id": 0,
 }
 
 # ---------- КЛЮЧЕВЫЕ СЛОВА ----------
@@ -81,21 +81,6 @@ def read_bot_token(path: str) -> str:
     return token
 
 
-def save_session_string(path: str, session: str):
-    ensure_data_dir()
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(session)
-    print(f"[+] Сессия сохранена в {path}")
-
-
-def load_session_string(path: str):
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        s = f.read().strip()
-    return s or None
-
-
 # ---------- УТИЛИТЫ ----------
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower().strip())
@@ -108,7 +93,7 @@ def contains_keywords(text: str, keywords) -> bool:
     return any(normalize_text(kw) in norm for kw in keywords)
 
 
-# ---------- ИНТЕРАКТИВНАЯ АВТОРИЗАЦИЯ ЧЕРЕЗ БОТА ----------
+# ---------- ИНТЕРАКТИВНАЯ АВТОРИЗАЦИЯ ----------
 async def _wait_for_user_input(queue: asyncio.Queue, prompt: str,
                                bot_client, your_id: int, timeout: int = AUTH_TIMEOUT) -> str:
     await bot_client.send_message(your_id, prompt)
@@ -122,25 +107,32 @@ async def interactive_auth(cfg: dict, bot_client):
     """
     Авторизует userbot: запрашивает код у Telegram, отправляет пользователю через бота,
     ждёт код в ответ, при необходимости — 2FA пароль.
-    Возвращает (user_client, session_string).
     """
+    # Важно: используем отдельное имя файла сессии для userbot
     user_client = TelegramClient(
-        StringSession(), cfg["api_id"], cfg["api_hash"]
+        os.path.join(DATA_DIR, "user_session"), cfg["api_id"], cfg["api_hash"]
     )
     await user_client.connect()
 
     if await user_client.is_user_authorized():
-        return user_client, user_client.session.save()
+        return user_client
 
     # Запрос кода у Telegram
     try:
-        await user_client.send_code_request(cfg["phone"])
+        sent_code = await user_client.send_code_request(cfg["phone"])
     except FloodWaitError as e:
         await user_client.disconnect()
         raise RuntimeError(
             f"❌ Telegram требует подождать {e.seconds} сек. перед повторным запросом кода. "
             f"Подождите и перезапустите бота."
         )
+
+    # Попытка принудительной отправки SMS через ResendCodeRequest
+    try:
+        await user_client(ResendCodeRequest(cfg["phone"], sent_code.phone_code_hash))
+        print("[Auth] Запрошена повторная отправка кода (SMS).")
+    except Exception as e:
+        print(f"[Auth] ResendCodeRequest не удался: {e}")
 
     # Очередь сообщений от вас боту
     queue: asyncio.Queue = asyncio.Queue()
@@ -151,9 +143,11 @@ async def interactive_auth(cfg: dict, bot_client):
 
     code = await _wait_for_user_input(
         queue,
-        "🔐 Требуется авторизация.\n"
-        "Telegram отправил код подтверждения на ваш номер.\n"
-        "Отправьте этот код сюда сообщением.",
+        "🔐 Требуется авторизация.\n\n"
+        "1. Проверьте **чат с официальным аккаунтом Telegram** в вашем приложении — "
+        "код чаще всего приходит именно туда, а не в SMS.\n"
+        "2. Если кода нет ни в приложении, ни в SMS, подождите минуту и попробуйте снова.\n\n"
+        "Отправьте код сюда сообщением.",
         bot_client, cfg["your_id"],
     )
 
@@ -193,9 +187,8 @@ async def interactive_auth(cfg: dict, bot_client):
         await user_client.disconnect()
         raise RuntimeError("❌ Авторизация не удалась.")
 
-    session_string = user_client.session.save()
-    await bot_client.send_message(cfg["your_id"], "✅ Авторизация успешна, сессия сохранена!")
-    return user_client, session_string
+    await bot_client.send_message(cfg["your_id"], "✅ Авторизация успешна!")
+    return user_client
 
 
 # ---------- ЛОГИКА ПАРСЕРА ----------
@@ -277,33 +270,36 @@ async def main():
     cfg = load_config()
     bot_token = read_bot_token(TOKEN_FILE)
 
-    # Бот (авторизация по токену — без кода)
+    # Бот для уведомлений (отдельный файл сессии)
     bot_client = TelegramClient(
         os.path.join(DATA_DIR, "bot_session"), cfg["api_id"], cfg["api_hash"]
     )
     await bot_client.start(bot_token=bot_token)
     print("✅ Бот для уведомлений авторизован.")
 
-    # Userbot: пробуем загрузить сохранённую сессию
+    # Userbot (отдельный файл сессии)
     user_client = None
-    session_string = load_session_string(SESSION_FILE)
-
-    if session_string:
+    try:
+        # Пытаемся подключиться с существующей сессией
         user_client = TelegramClient(
-            StringSession(session_string), cfg["api_id"], cfg["api_hash"]
+            os.path.join(DATA_DIR, "user_session"), cfg["api_id"], cfg["api_hash"]
         )
         await user_client.connect()
         if await user_client.is_user_authorized():
             print("✅ Userbot авторизован (сессия из файла).")
         else:
-            print("⚠️ Сохранённая сессия недействительна, запускаем переавторизацию...")
+            print("⚠️ Сессия недействительна. Требуется авторизация.")
             await user_client.disconnect()
             user_client = None
+    except Exception as e:
+        print(f"⚠️ Не удалось подключиться с существующей сессией: {e}")
+        if user_client:
+            await user_client.disconnect()
+        user_client = None
 
     if user_client is None:
-        print("⚠️ Сессии нет — запускаем интерактивную авторизацию через бота...")
-        user_client, session_string = await interactive_auth(cfg, bot_client)
-        save_session_string(SESSION_FILE, session_string)
+        print("⚠️ Запуск интерактивной авторизации через бота...")
+        user_client = await interactive_auth(cfg, bot_client)
 
     try:
         print("\n🔎 Этап 1: Поиск каналов...")
@@ -333,6 +329,7 @@ async def main():
         else:
             print("\n😔 Конкурсы не найдены.")
     finally:
+        # Корректное закрытие соединений
         await user_client.disconnect()
         await bot_client.disconnect()
 
