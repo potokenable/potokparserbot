@@ -31,17 +31,18 @@ SESSION_FILE = os.path.join(DATA_DIR, "session_string.txt")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
-MESSAGES_TO_CHECK = 50
+# ---------- ДЕФОЛТНЫЕ ЛИМИТЫ (0 = безлимит) ----------
+MESSAGES_TO_CHECK = 100
 DELAY_BETWEEN_CHANNELS = 3
 DELAY_BETWEEN_PARTICIPATION = 6
 AUTO_SCAN_INTERVAL = 900
-MAX_CHANNELS_PER_PROFILE = 60
+MAX_CHANNELS_PER_PROFILE = 100
 
 # ---------- СЛОВАРИ ----------
 
 GTA6_MENTIONS = [
     "gta vi", "gta 6", "gta6", "grand theft auto vi", "grand theft auto 6",
-    "grand theft auto", "gta-v", "gta-v", "gta v",
+    "grand theft auto", "gta-v", "gta v",
     "гта 6", "гта6", "гта vi", "гтаvi", "гта-6", "gta-vi", "гта", "гта5", "гта 5",
     "gta v1", "gta vl", "gta 6i", "gta6i", "gta six", "gta ⅵ", "gta Ⅵ",
     "gta6️⃣", "gta 6️⃣", "гта шестой", "гта шестая", "гта 6-я", "гта 6ая",
@@ -75,9 +76,8 @@ GTA6_MENTIONS = [
     "#gta", "#gta6", "#gtavi", "#gtav", "#gtaonline", "#rockstar",
     "#grandtheftauto", "#розыгрышgta", "#giveawaygta",
     "гта онлайн", "gta online",
-    "gta vi giveaway", "gta 6 giveaway", "gta vi конкурс", "gta 6 конкурс",
+    "gta vi конкурс", "gta 6 конкурс",
     "gta vi розыгрыш", "gta 6 розыгрыш", "gta vi выиграть", "gta 6 выиграть",
-    "gta + ps5 + giveaway", "gta + xbox + giveaway",
     "gta + steam + giveaway", "gta + аккаунт",
     "gta vi + подписка", "gta 6 + подписка",
     "джта 6", "джта vi", "гта 6 (gta)", "gta (гта 6)", "gta 6 (гта)",
@@ -91,11 +91,12 @@ GIVEAWAY_MARKERS = [
     "участвуй", "участвовать", "принять участие", "прими участие",
     "join", "enter", "take part", "выигрывай",
     "получи шанс", "шанс получить", "шанс выиграть", "chance to win",
-    "разыграть", "разыграем", "подарить", "вручить", "отдать",
+    "разыграть", "подарить", "вручить", "отдать",
     "получить бесплатно", "за подписку", "за репост", "за комментарий",
     "за активность", "sweepstakes", "contest",
     "бесплатный доступ", "free access", "free copy", "free key",
-    "give-away", "give away", "разыгрывается",
+    "give-away", "give away", "разыгрывается", "подарю", "раздача",
+    "раздаю", "халява", "бесплатно отдам", "отдаю бесплатно",
 ]
 
 PARTICIPATE_BUTTON_MARKERS = [
@@ -111,19 +112,19 @@ SUBSCRIBE_BUTTON_MARKERS = [
     "проверить", "check", "verify",
 ]
 
-# ---------- КОНФИГ ПО УМОЛЧАНИЮ ----------
+# ---------- КОНФИГ ----------
 DEFAULT_CONFIG = {
     "api_id": 0,
     "api_hash": "",
     "phone": "",
     "your_id": 0,
     "auto_scan_interval_seconds": AUTO_SCAN_INTERVAL,
-    "max_participations_per_run": 5,
-    "max_participations_per_day": 30,
+    "messages_to_check": MESSAGES_TO_CHECK,
+    "max_channels_per_profile": MAX_CHANNELS_PER_PROFILE,
+    "max_participations_per_run": 0,   # 0 = безлимит
+    "max_participations_per_day": 0,   # 0 = безлимит
     "profiles": {
         "GTA VI": {
-            # ВАЖНО: эти слова ищут ИМЕНА каналов, а не содержимое постов.
-            # Только широкие темы — так находится больше каналов.
             "channel_keywords": [
                 "GTA VI", "GTA6", "GTA 6", "ГТА 6", "ГТА6",
                 "Grand Theft Auto 6", "Grand Theft Auto VI",
@@ -154,6 +155,17 @@ bot_client = None
 user_client = None
 config_data = DEFAULT_CONFIG
 
+# ---------- КОНТРОЛЬ СКАНА ----------
+_scan_running = False
+_stop_event = None  # asyncio.Event
+
+
+def _is_unlimited(v) -> bool:
+    try:
+        return int(v) <= 0
+    except Exception:
+        return True
+
 
 # ---------- ФАЙЛЫ ----------
 def ensure_data_dir():
@@ -176,31 +188,33 @@ def load_config() -> dict:
 
     if "profiles" not in cfg:
         cfg["profiles"] = DEFAULT_CONFIG["profiles"]
-        save_config(cfg)
 
-    migrated = False
+    # миграция и дефолты
+    for key, val in [
+        ("messages_to_check", MESSAGES_TO_CHECK),
+        ("max_channels_per_profile", MAX_CHANNELS_PER_PROFILE),
+        ("max_participations_per_run", 0),
+        ("max_participations_per_day", 0),
+    ]:
+        if key not in cfg:
+            cfg[key] = val
+
     for name, prof in cfg["profiles"].items():
         if "topic_keywords" not in prof:
             if name in DEFAULT_CONFIG["profiles"]:
                 prof["topic_keywords"] = DEFAULT_CONFIG["profiles"][name]["topic_keywords"]
             else:
                 prof["topic_keywords"] = [name.lower()]
-            migrated = True
         if "contest_keywords" not in prof:
             prof["contest_keywords"] = GIVEAWAY_MARKERS
-            migrated = True
         if "require_buttons" not in prof:
             prof["require_buttons"] = False
-            migrated = True
-        # принудительное отключение жёсткого фильтра кнопок
-        # (это ломало поиск в предыдущей версии)
+        # принудительное отключение старого жёсткого фильтра
         if prof.get("require_buttons") is True:
-            print(f"[!] Профиль '{name}': require_buttons True->False (фикс фильтра)")
+            print(f"[!] Профиль '{name}': require_buttons True->False (фикс)")
             prof["require_buttons"] = False
-            migrated = True
 
-    if migrated:
-        save_config(cfg)
+    save_config(cfg)
 
     missing = [k for k in ("api_id", "api_hash", "your_id") if not cfg.get(k)]
     if missing:
@@ -293,9 +307,9 @@ def contains_any(text: str, keywords) -> bool:
 def is_relevant_post(msg, profile: dict, ch_title: str = "", ch_username: str = "") -> bool:
     """
     Пост релевантен, если:
-      1) в тексте есть giveaway-маркер
-      2) тема (topic_keywords) есть в тексте ИЛИ в названии/юзернейме канала
-    Кнопки больше НЕ обязательны для фильтра — только для авто-участия.
+      - есть giveaway-маркер в тексте
+      - тема (topic_keywords) есть в тексте ИЛИ в названии/юзернейме канала
+    Кнопки НЕ обязательны. Пост без кнопок тоже будет отправлен.
     """
     text = getattr(msg, "text", None)
     if not text:
@@ -320,7 +334,6 @@ def is_relevant_post(msg, profile: dict, ch_title: str = "", ch_username: str = 
 
 
 def find_participate_button(msg):
-    """Возвращает MessageButton участия или None."""
     if not msg or not msg.buttons:
         return None
     for row in msg.buttons:
@@ -350,7 +363,7 @@ async def qr_auth(cfg: dict, b_client):
     if await u_client.is_user_authorized():
         return u_client
 
-    await b_client.send_message(cfg["your_id"], "🔄 Генерация QR-кода для входа...")
+    await b_client.send_message(cfg["your_id"], "🔄 Генерация QR-кода...")
     qr_login = await u_client.qr_login()
 
     qr = qrcode.QRCode(border=1)
@@ -363,7 +376,7 @@ async def qr_auth(cfg: dict, b_client):
 
     await b_client.send_file(
         cfg["your_id"], buf,
-        caption="📱 Отсканируйте QR-код в Telegram:\n"
+        caption="📱 Отсканируйте QR-код:\n"
                 "Настройки -> Устройства -> Подключить устройство\n\n"
                 "⏳ Ожидание (5 минут)..."
     )
@@ -374,14 +387,15 @@ async def qr_auth(cfg: dict, b_client):
         await u_client.disconnect()
         raise RuntimeError("❌ Таймаут QR-входа.")
     except SessionPasswordNeededError:
-        await b_client.send_message(cfg["your_id"], "🔐 Требуется 2FA. Введите облачный пароль:")
+        await b_client.send_message(cfg["your_id"], "🔐 2FA. Введите облачный пароль:")
         queue = asyncio.Queue()
 
         async def password_handler(event):
             if event.sender_id == int(cfg["your_id"]):
                 await queue.put(event.raw_text.strip())
 
-        b_client.add_event_handler(password_handler, events.NewMessage(from_users=cfg["your_id"]))
+        b_client.add_event_handler(password_handler,
+                                    events.NewMessage(from_users=cfg["your_id"]))
         try:
             for attempt in range(3):
                 password = await asyncio.wait_for(queue.get(), timeout=120)
@@ -390,9 +404,9 @@ async def qr_auth(cfg: dict, b_client):
                     break
                 except PasswordHashInvalidError:
                     if attempt < 2:
-                        await b_client.send_message(cfg["your_id"], "❌ Неверный пароль, ещё раз:")
+                        await b_client.send_message(cfg["your_id"], "❌ Неверный пароль:")
                     else:
-                        raise RuntimeError("❌ Превышено число попыток 2FA.")
+                        raise RuntimeError("❌ 3 попытки 2FA исчерпаны.")
         finally:
             b_client.remove_event_handler(password_handler)
     except Exception as e:
@@ -457,8 +471,35 @@ async def try_participate(u_client, msg, channel_username: str, message_id: int)
         return ("failed", str(e)[:120])
 
 
-# ---------- ОСНОВНОЙ ПАРСЕР ----------
-async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=False, debug=False):
+# ---------- ПАРСЕР ----------
+async def run_parser_task(b_client, u_client, cfg, profile_name=None,
+                          auto_mode=False, debug=False):
+    global _scan_running, _stop_event
+
+    if _scan_running and not debug:
+        await b_client.send_message(
+            cfg["your_id"],
+            "⚠️ Скан уже идёт. Дождись окончания или нажми «⏹ Стоп»."
+        )
+        return
+
+    _scan_running = True
+    _stop_event = asyncio.Event()
+
+    try:
+        await _run_parser_inner(
+            b_client, u_client, cfg, profile_name, auto_mode, debug
+        )
+    finally:
+        _scan_running = False
+        if _stop_event:
+            _stop_event.clear()
+
+
+async def _run_parser_inner(b_client, u_client, cfg, profile_name,
+                             auto_mode, debug):
+    global _stop_event
+
     profiles_to_run = {}
     if profile_name and profile_name in cfg["profiles"]:
         profiles_to_run[profile_name] = cfg["profiles"][profile_name]
@@ -476,16 +517,32 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
         state = {"date": today, "participated_today": 0}
         save_state(state)
 
-    max_per_run = int(cfg.get("max_participations_per_run", 5))
-    max_per_day = int(cfg.get("max_participations_per_day", 30))
+    max_per_run = int(cfg.get("max_participations_per_run", 0))
+    max_per_day = int(cfg.get("max_participations_per_day", 0))
+    messages_to_check = int(cfg.get("messages_to_check", MESSAGES_TO_CHECK))
+    max_channels = int(cfg.get("max_channels_per_profile", MAX_CHANNELS_PER_PROFILE))
+
     participated_this_run = 0
     new_posts = []
     debug_lines = []
+    stopped = False
+    total_channels = 0
 
-    if debug:
-        await b_client.send_message(cfg["your_id"], "🔍 Режим диагностики запущен...")
+    if not auto_mode:
+        run_mode = "🔍 диагностика" if debug else "🚀 поиск"
+        await b_client.send_message(
+            cfg["your_id"],
+            f"{run_mode} запущен (профилей: {len(profiles_to_run)}).\n"
+            f"Нажми /stop или кнопку «⏹ Стоп» чтобы прервать.\n"
+            f"Лимит участий: {'∞' if _is_unlimited(max_per_run) else max_per_run}/запуск, "
+            f"{'∞' if _is_unlimited(max_per_day) else max_per_day}/день."
+        )
 
     for prof_name, data in profiles_to_run.items():
+        if _stop_event.is_set():
+            stopped = True
+            break
+
         channel_kw = data.get("channel_keywords", [])
         if not channel_kw:
             debug_lines.append(f"❌ {prof_name}: пустой channel_keywords")
@@ -494,19 +551,22 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
         found_channels = {}
         search_errors = 0
         for kw in channel_kw:
+            if _stop_event.is_set():
+                break
             try:
                 result = await u_client(SearchRequest(q=kw, limit=25))
                 for chat in result.chats:
                     if isinstance(chat, (Channel, Chat)) and getattr(chat, "username", None):
                         found_channels[chat.id] = chat
             except FloodWaitError as e:
-                await asyncio.sleep(e.seconds)
+                await asyncio.sleep(min(e.seconds, 60))
             except Exception as e:
                 search_errors += 1
                 debug_lines.append(f"⚠️ search '{kw}': {str(e)[:80]}")
             await asyncio.sleep(0.8)
 
-        channels_list = list(found_channels.values())[:MAX_CHANNELS_PER_PROFILE]
+        channels_list = list(found_channels.values())[:max_channels]
+        total_channels += len(channels_list)
 
         if debug:
             debug_lines.append(
@@ -515,25 +575,31 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
             )
 
         for ch in channels_list:
+            if _stop_event.is_set():
+                stopped = True
+                break
+
             ch_title = getattr(ch, "title", "") or ""
             ch_username = getattr(ch, "username", "") or ""
 
             try:
-                messages = await u_client.get_messages(ch, limit=MESSAGES_TO_CHECK)
+                messages = await u_client.get_messages(ch, limit=messages_to_check)
             except FloodWaitError as e:
-                await asyncio.sleep(e.seconds)
+                await asyncio.sleep(min(e.seconds, 60))
                 continue
             except Exception as e:
                 if debug:
                     debug_lines.append(f"   ⚠️ чтение @{ch_username}: {str(e)[:60]}")
                 continue
 
-            # Статистика для debug
             giveaway_text_posts = 0
             with_buttons = 0
             relevant_posts = 0
 
             for msg in messages:
+                if _stop_event.is_set():
+                    stopped = True
+                    break
                 if not msg or not msg.text:
                     continue
 
@@ -552,11 +618,11 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                 relevant_posts += 1
                 link = f"https://t.me/{ch_username}/{msg.id}"
 
-                status, detail = "link_only", "Лимит"
-                can_participate = (
-                    participated_this_run < max_per_run
-                    and state["participated_today"] < max_per_day
-                )
+                # Проверка лимитов (0 = безлимит)
+                run_limit_ok = _is_unlimited(max_per_run) or participated_this_run < max_per_run
+                day_limit_ok = _is_unlimited(max_per_day) or state["participated_today"] < max_per_day
+                can_participate = run_limit_ok and day_limit_ok
+
                 if can_participate:
                     status, detail = await try_participate(
                         u_client, msg, ch_username, msg.id
@@ -565,6 +631,8 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                         state["participated_today"] += 1
                         participated_this_run += 1
                     await asyncio.sleep(DELAY_BETWEEN_PARTICIPATION + random.uniform(0, 2))
+                else:
+                    status, detail = "link_only", "Дневной лимит участий достигнут"
 
                 history[uid] = {
                     "status": status,
@@ -586,14 +654,16 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
 
             if debug:
                 debug_lines.append(
-                    f"   • @{ch_username}: всего {len(messages)} | "
+                    f"   • @{ch_username}: {len(messages)} | "
                     f"giveaway-слов {giveaway_text_posts} | "
                     f"с кнопками {with_buttons} | "
-                    f"прошло фильтр {relevant_posts}"
+                    f"прошло {relevant_posts}"
                 )
 
-            await asyncio.sleep(DELAY_BETWEEN_CHANNELS)
+            if not _stop_event.is_set():
+                await asyncio.sleep(DELAY_BETWEEN_CHANNELS)
 
+    # ---- СОХРАНЯЕМ И ОТПРАВЛЯЕМ ВСЁ, ЧТО НАШЛИ (даже если стоп) ----
     save_history(history)
     save_state(state)
 
@@ -604,7 +674,6 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
         except Exception:
             pass
 
-    # ---- ОТПРАВКА УВЕДОМЛЕНИЙ ----
     for p in new_posts:
         emoji, header = {
             "participated": ("✅", "УЧАСТИЕ ПРИНЯТО"),
@@ -627,32 +696,34 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
             )
         except Exception:
             pass
-        await asyncio.sleep(1)
-
-    if not new_posts and not auto_mode:
-        await b_client.send_message(cfg["your_id"], "😔 Новых розыгрышей не найдено.")
+        await asyncio.sleep(0.7)
 
     if not auto_mode:
-        await b_client.send_message(
-            cfg["your_id"],
-            f"🏁 Готово!\n"
-            f"Новых постов: {len(new_posts)}\n"
-            f"Участий в этот запуск: {participated_this_run}\n"
-            f"Всего сегодня: {state['participated_today']}/{max_per_day}"
+        summary = (
+            f"🏁 <b>Готово{'(ОСТАНОВЛЕНО)' if stopped else ''}!</b>\n\n"
+            f"📡 Каналов проверено: {total_channels}\n"
+            f"📥 Новых постов: {len(new_posts)}\n"
+            f"✅ Участий: {participated_this_run}\n"
+            f"📊 Сегодня: {state['participated_today']}"
+            f"{'' if _is_unlimited(max_per_day) else '/' + str(max_per_day)}"
         )
+        await b_client.send_message(cfg["your_id"], summary, parse_mode="html")
 
 
 # ---------- АВТО-СКАНЕР ----------
 async def periodic_scanner(b_client, u_client, cfg, interval: int):
     await asyncio.sleep(30)
     while True:
-        try:
-            await run_parser_task(b_client, u_client, cfg, auto_mode=True)
-        except Exception as e:
+        if not _scan_running:
             try:
-                await b_client.send_message(cfg["your_id"], f"⚠️ Авто-сканер: {str(e)[:200]}")
-            except Exception:
-                pass
+                await run_parser_task(b_client, u_client, cfg, auto_mode=True)
+            except Exception as e:
+                try:
+                    await b_client.send_message(
+                        cfg["your_id"], f"⚠️ Авто-сканер: {str(e)[:200]}"
+                    )
+                except Exception:
+                    pass
         await asyncio.sleep(interval)
 
 
@@ -665,22 +736,20 @@ def export_history_csv() -> str:
         w.writerow(["uid", "status", "detail", "date", "link", "profile", "channel"])
         for uid, info in history.items():
             w.writerow([
-                uid,
-                info.get("status", ""),
-                info.get("detail", ""),
-                info.get("date", ""),
-                info.get("link", ""),
-                info.get("profile", ""),
-                info.get("channel", ""),
+                uid, info.get("status", ""), info.get("detail", ""),
+                info.get("date", ""), info.get("link", ""),
+                info.get("profile", ""), info.get("channel", ""),
             ])
     return path
 
 
 # ---------- МЕНЮ ----------
 def get_main_menu_buttons(cfg):
+    running_label = "⏹ Стоп (идёт скан)" if _scan_running else "⏹ Стоп"
     return [
         [Button.inline("🚀 Запустить весь поиск", data=b"run_all")],
         [Button.inline("📂 Профиль для поиска", data=b"select_run_profile")],
+        [Button.inline(running_label, data=b"stop_scan")],
         [Button.inline("⚙️ Управление профилями", data=b"manage_profiles")],
         [Button.inline("➕ Добавить профиль", data=b"add_profile")],
         [Button.inline("🔍 Диагностика", data=b"debug")],
@@ -696,7 +765,8 @@ async def _text_input(b_client, cfg, timeout=60) -> str:
     async def handler(e):
         await queue.put(e.raw_text.strip())
 
-    b_client.add_event_handler(handler, events.NewMessage(from_users=int(cfg["your_id"])))
+    b_client.add_event_handler(handler,
+                                events.NewMessage(from_users=int(cfg["your_id"])))
     try:
         return await asyncio.wait_for(queue.get(), timeout=timeout)
     finally:
@@ -740,7 +810,7 @@ async def setup_bot_handlers(b_client):
             "🤖 <b>Панель парсера розыгрышей</b>\n\n"
             f"Автоскан: каждые "
             f"{config_data.get('auto_scan_interval_seconds', AUTO_SCAN_INTERVAL) // 60} мин.\n"
-            "Команды: /find /debug",
+            "Команды: /find /stop /debug",
             buttons=get_main_menu_buttons(config_data),
             parse_mode="html",
         )
@@ -749,19 +819,29 @@ async def setup_bot_handlers(b_client):
     async def find_cmd(event):
         if event.sender_id != int(config_data["your_id"]):
             return
-        await event.respond("⏳ Запускаю поиск...")
         asyncio.create_task(run_parser_task(b_client, user_client, config_data))
+
+    @b_client.on(events.NewMessage(pattern="/stop"))
+    async def stop_cmd(event):
+        if event.sender_id != int(config_data["your_id"]):
+            return
+        if _scan_running and _stop_event and not _stop_event.is_set():
+            _stop_event.set()
+            await event.respond("⏹ Останавливаю скан...")
+        else:
+            await event.respond("ℹ️ Скан не запущен.")
 
     @b_client.on(events.NewMessage(pattern="/debug"))
     async def debug_cmd(event):
         if event.sender_id != int(config_data["your_id"]):
             return
-        await event.respond("🔍 Запускаю диагностику...")
-        asyncio.create_task(run_parser_task(b_client, user_client, config_data, debug=True))
+        asyncio.create_task(run_parser_task(
+            b_client, user_client, config_data, debug=True
+        ))
 
     @b_client.on(events.CallbackQuery)
     async def cb(event):
-        global config_data, user_client
+        global config_data, user_client, _stop_event
         if event.sender_id != int(config_data["your_id"]):
             await event.answer("⛔ Доступ запрещён", alert=True)
             return
@@ -774,12 +854,27 @@ async def setup_bot_handlers(b_client):
                              parse_mode="html")
 
         elif data == "run_all":
-            await event.edit("⏳ Запускаю поиск по всем профилям...")
+            if _scan_running:
+                await event.answer("⚠️ Скан уже идёт!", alert=True)
+                return
+            await event.edit("⏳ Запускаю поиск...")
             asyncio.create_task(run_parser_task(b_client, user_client, config_data))
 
+        elif data == "stop_scan":
+            if _scan_running and _stop_event and not _stop_event.is_set():
+                _stop_event.set()
+                await event.answer("⏹ Останавливаю...", alert=True)
+            else:
+                await event.answer("ℹ️ Скан не запущен", alert=True)
+
         elif data == "debug":
+            if _scan_running:
+                await event.answer("⚠️ Скан уже идёт!", alert=True)
+                return
             await event.edit("🔍 Диагностика...")
-            asyncio.create_task(run_parser_task(b_client, user_client, config_data, debug=True))
+            asyncio.create_task(run_parser_task(
+                b_client, user_client, config_data, debug=True
+            ))
 
         elif data == "select_run_profile":
             profiles = list(config_data["profiles"].keys())
@@ -791,9 +886,14 @@ async def setup_bot_handlers(b_client):
             await event.edit("📂 Выберите профиль:", buttons=btns)
 
         elif data.startswith("run_p_"):
+            if _scan_running:
+                await event.answer("⚠️ Скан уже идёт!", alert=True)
+                return
             p_name = data.replace("run_p_", "")
             await event.edit(f"⏳ Запуск: <b>{p_name}</b>...", parse_mode="html")
-            asyncio.create_task(run_parser_task(b_client, user_client, config_data, profile_name=p_name))
+            asyncio.create_task(run_parser_task(
+                b_client, user_client, config_data, profile_name=p_name
+            ))
 
         elif data == "manage_profiles":
             profiles = list(config_data["profiles"].keys())
@@ -826,13 +926,15 @@ async def setup_bot_handlers(b_client):
                           .replace("set_tpk_", ""))
             kind = "каналов" if is_ch else ("конкурсов" if is_co else "темы")
             await event.edit(
-                f"✍️ Введите новые ключи <b>{kind}</b> для <b>{p_name}</b> через запятую:",
+                f"✍️ Введите новые ключи <b>{kind}</b> для <b>{p_name}</b> "
+                f"через запятую:",
                 parse_mode="html",
             )
             try:
                 new_text = await _text_input(b_client, config_data)
             except asyncio.TimeoutError:
-                await b_client.send_message(config_data["your_id"], "❌ Время истекло.",
+                await b_client.send_message(config_data["your_id"],
+                                            "❌ Время истекло.",
                                             buttons=get_main_menu_buttons(config_data))
                 return
             kw = [k.strip() for k in new_text.split(",") if k.strip()]
@@ -894,14 +996,16 @@ async def setup_bot_handlers(b_client):
                 by_status[s] = by_status.get(s, 0) + 1
                 p = info.get("profile", "—")
                 by_profile[p] = by_profile.get(p, 0) + 1
+            max_day = config_data.get("max_participations_per_day", 0)
+            day_str = f"{state.get('participated_today', 0)}" + \
+                      ("" if _is_unlimited(max_day) else f"/{max_day}")
             text = (
                 f"📊 <b>Статистика</b>\n\n"
                 f"Всего постов: <b>{total}</b>\n"
                 f"✅ Участий: <b>{by_status.get('participated', 0)}</b>\n"
                 f"🔗 Только ссылки: <b>{by_status.get('link_only', 0)}</b>\n"
                 f"⚠️ Ошибок: <b>{by_status.get('failed', 0)}</b>\n\n"
-                f"Сегодня: {state.get('participated_today', 0)}/"
-                f"{config_data.get('max_participations_per_day', 30)}\n\n"
+                f"Сегодня: {day_str}\n\n"
                 f"<b>По профилям:</b>\n"
             )
             for p, n in sorted(by_profile.items(), key=lambda x: -x[1]):
