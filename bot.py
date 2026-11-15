@@ -101,9 +101,6 @@ def contains_keywords(text: str, keywords) -> bool:
 
 # ---------- QR-АВТОРИЗАЦИЯ ----------
 async def qr_auth(cfg: dict, bot_client):
-    """
-    Авторизация через QR-код с надежным перехватом 2FA-пароля через бота.
-    """
     user_client = TelegramClient(StringSession(), cfg["api_id"], cfg["api_hash"])
     await user_client.connect()
 
@@ -112,10 +109,8 @@ async def qr_auth(cfg: dict, bot_client):
 
     await bot_client.send_message(cfg["your_id"], "🔄 Генерация QR-кода для входа...")
     
-    # Генерируем QR-логин
     qr_login = await user_client.qr_login()
 
-    # Создаем изображение QR-кода
     qr = qrcode.QRCode(border=1)
     qr.add_data(qr_login.url)
     qr.make(fit=True)
@@ -124,28 +119,29 @@ async def qr_auth(cfg: dict, bot_client):
     img.save(buf, format="PNG")
     buf.seek(0)
 
-    # Отправляем фото через бота
     await bot_client.send_file(
         cfg["your_id"],
         buf,
         caption="📱 **Отсканируйте этот QR-код в Telegram:**\n"
                 "Настройки -> Устройства -> Подключить устройство\n\n"
-                "Ожидание сканирования (2 минуты)..."
+                "⏳ Ожидание сканирования (5 минут)..."
     )
 
     try:
-        await qr_login.wait(timeout=120)
+        await qr_login.wait(timeout=300)
+    except asyncio.TimeoutError:
+        await user_client.disconnect()
+        await bot_client.send_message(cfg["your_id"], "❌ Время ожидания сканирования QR-кода истекло (5 минут). Перезапустите скрипт.")
+        raise RuntimeError("❌ Время ожидания сканирования QR-кода истекло.")
     except SessionPasswordNeededError:
-        await bot_client.send_message(cfg["your_id"], "🔐 Обнаружена защита 2FA. Введите ваш пароль облачного пароля в ответном сообщении:")
+        await bot_client.send_message(cfg["your_id"], "🔐 Обнаружена защита 2FA. Введите ваш облачный пароль в ответном сообщении:")
         
         queue = asyncio.Queue()
 
-        # Функция-обработчик для получения 2FA пароля из чата с ботом
         async def password_handler(event):
             if event.sender_id == int(cfg["your_id"]):
                 await queue.put(event.raw_text.strip())
 
-        # Добавляем обработчик событий
         bot_client.add_event_handler(password_handler, events.NewMessage(from_users=cfg["your_id"]))
         
         try:
@@ -155,7 +151,6 @@ async def qr_auth(cfg: dict, bot_client):
             await user_client.disconnect()
             raise RuntimeError("❌ Таймаут ввода пароля 2FA.")
         finally:
-            # Обязательно удаляем обработчик, чтобы он не висел дальше
             bot_client.remove_event_handler(password_handler)
             
     except Exception as e:
@@ -166,7 +161,6 @@ async def qr_auth(cfg: dict, bot_client):
         await user_client.disconnect()
         raise RuntimeError("❌ Авторизация не удалась.")
 
-    # Сохраняем сессию
     session_string = user_client.session.save()
     save_session_string(SESSION_FILE, session_string)
     await bot_client.send_message(cfg["your_id"], "✅ Авторизация успешна! Сессия сохранена.")
@@ -239,12 +233,10 @@ async def main():
     cfg = load_config()
     bot_token = read_bot_token(TOKEN_FILE)
 
-    # Бот для уведомлений и отправки QR
     bot_client = TelegramClient(os.path.join(DATA_DIR, "bot_session"), cfg["api_id"], cfg["api_hash"])
     await bot_client.start(bot_token=bot_token)
     print("✅ Бот авторизован.")
 
-    # Userbot
     session_string = read_session_string(SESSION_FILE)
     user_client = None
 
