@@ -30,6 +30,7 @@ TOKEN_FILE = os.path.join(DATA_DIR, "token.txt")
 SESSION_FILE = os.path.join(DATA_DIR, "session_string.txt")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
+BLACKLIST_FILE = os.path.join(DATA_DIR, "blacklist.json")
 
 # ---------- НАСТРОЙКИ ----------
 MESSAGES_TO_CHECK = 50
@@ -150,6 +151,21 @@ def save_history(history: dict):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+def load_blacklist() -> list:
+    ensure_data_dir()
+    if not os.path.exists(BLACKLIST_FILE):
+        return []
+    try:
+        with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_blacklist(bl: list):
+    ensure_data_dir()
+    with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
+        json.dump(bl, f, ensure_ascii=False, indent=2)
+
 def load_state() -> dict:
     ensure_data_dir()
     if not os.path.exists(STATE_FILE):
@@ -201,6 +217,11 @@ def contains_any(text: str, keywords) -> bool:
 def is_relevant_post(msg, profile: dict, ch_title: str = "", ch_username: str = "") -> bool:
     text = getattr(msg, "text", None)
     if not text:
+        return False
+
+    # Проверка черного списка каналов
+    blacklist = load_blacklist()
+    if ch_username and ch_username.lower() in [b.lower() for b in blacklist]:
         return False
 
     contest_kw = profile.get("contest_keywords", GIVEAWAY_MARKERS)
@@ -340,7 +361,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
         total_channels = 0
 
         if not auto_mode:
-            await b_client.send_message(cfg["your_id"], "[~] Запущен быстрый поиск розыгрышей...")
+            await b_client.send_message(cfg["your_id"], "[~] Запущен поиск розыгрышей...")
 
         for prof_name, data in profiles_to_run.items():
             if _stop_event.is_set():
@@ -349,7 +370,6 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
             channel_kw = data.get("channel_keywords", [])
             found_channels = {}
 
-            # Добавляем пресеты (с таймаутом на каждый)
             for uname in PRESET_CHANNELS:
                 if _stop_event.is_set():
                     break
@@ -360,7 +380,6 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                 except Exception:
                     pass
 
-            # Поиск через ключевые слова
             for kw in channel_kw:
                 if _stop_event.is_set():
                     break
@@ -434,7 +453,7 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                         "detail": detail,
                         "link": link,
                         "profile": prof_name,
-                        "channel": ch_title or ch_username,
+                        "channel": ch_username,
                         "text": msg.text[:400],
                     })
 
@@ -456,11 +475,16 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                 f"{p['text'][:300]}...\n\n"
                 f"<a href=\"{p['link']}\">Перейти к посту</a>"
             )
+            # Серые/стандартные кнопки действий с инлайн-функционалом
+            buttons = [
+                [Button.url("🔗 Открыть пост", p["link"])],
+                [Button.inline(f"❌ В черный список @{p['channel']}", data=f"bl_add_{p['channel']}".encode())]
+            ]
             try:
-                await b_client.send_message(cfg["your_id"], text, parse_mode="html", link_preview=False)
+                await b_client.send_message(cfg["your_id"], text, parse_mode="html", link_preview=False, buttons=buttons)
             except Exception:
                 pass
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.4)
 
         if not auto_mode:
             await b_client.send_message(
@@ -491,10 +515,9 @@ def get_main_menu_buttons(cfg):
     running_label = "[■] СТОП (идёт скан)" if _scan_running else "[■] СТОП"
     return [
         [Button.inline("[>] ЗАПУСТИТЬ ПОИСК", data=b"run_all")],
-        [Button.inline("[=] ПРОФИЛИ", data=b"select_run_profile")],
+        [Button.inline("[=] ПРОФИЛИ", data=b"manage_profiles")],
         [Button.inline(running_label, data=b"stop_scan")],
         [Button.inline("[!] СБРОСИТЬ ЗАВИСАНИЕ", data=b"force_reset")],
-        [Button.inline("[⚙] НАСТРОЙКИ", data=b"manage_profiles")],
         [Button.inline("[x] СБРОСИТЬ ИСТОРИЮ", data=b"clear_history")],
     ]
 
@@ -517,7 +540,7 @@ async def setup_bot_handlers(b_client):
         _scan_running = False
         if _stop_event:
             _stop_event.set()
-        await event.respond("[+] Состояние принудительно сброшено. Зависания устранены.")
+        await event.respond("[+] Состояние принудительно сброшено.")
 
     @b_client.on(events.CallbackQuery)
     async def cb(event):
@@ -547,6 +570,40 @@ async def setup_bot_handlers(b_client):
                 _stop_event.set()
             await event.answer("Зависание сброшено!", alert=True)
             await event.edit("<b>[ГЛАВНОЕ МЕНЮ]</b>", buttons=get_main_menu_buttons(config_data), parse_mode="html")
+        elif data == "manage_profiles":
+            profiles = list(config_data["profiles"].keys())
+            if not profiles:
+                await event.edit("📂 Нет профилей.", buttons=[[Button.inline("« Назад", data=b"main_menu")]])
+                return
+            btns = [[Button.inline(f"📁 {p}", data=f"edit_p_{p}".encode())] for p in profiles]
+            btns.append([Button.inline("« Назад", data=b"main_menu")])
+            await event.edit("<b>[УПРАВЛЕНИЕ ПРОФИЛЯМИ]</b>", buttons=btns, parse_mode="html")
+        elif data.startswith("edit_p_"):
+            p_name = data.replace("edit_p_", "")
+            prof = config_data["profiles"].get(p_name, {})
+            ch_kw = ", ".join(prof.get("channel_keywords", []))
+            co_kw = ", ".join(prof.get("contest_keywords", []))
+            text = (
+                f"<b>Профиль: {p_name}</b>\n\n"
+                f"Ключи каналов: <code>{ch_kw}</code>\n"
+            )
+            btns = [
+                [Button.inline("🗑 Удалить профиль", data=f"del_p_{p_name}".encode())],
+                [Button.inline("« К списку", data=b"manage_profiles")]
+            ]
+            await event.edit(text, buttons=btns, parse_mode="html")
+        elif data.startswith("del_p_"):
+            p_name = data.replace("del_p_", "")
+            config_data["profiles"].pop(p_name, None)
+            save_config(config_data)
+            await event.edit(f"🗑 Профиль <b>{p_name}</b> удален.", buttons=get_main_menu_buttons(config_data), parse_mode="html")
+        elif data.startswith("bl_add_"):
+            chan = data.replace("bl_add_", "")
+            bl = load_blacklist()
+            if chan.lower() not in [b.lower() for b in bl]:
+                bl.append(chan)
+                save_blacklist(bl)
+            await event.answer(f"Канал @{chan} добавлен в черный список!", alert=True)
         elif data == "clear_history":
             save_history({})
             await event.answer("История сброшена", alert=True)
