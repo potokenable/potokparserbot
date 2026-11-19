@@ -1,8 +1,7 @@
 import asyncio
-import csv
+import hashlib
 import json
 import os
-import random
 import re
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
@@ -15,15 +14,13 @@ from telethon.errors import (
     PasswordHashInvalidError,
     UserAlreadyParticipantError,
     ChannelsTooMuchError,
-    ChannelPrivateError,
-    ChatAdminRequiredError,
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.types import Channel, Chat
 
-# ---------- ПУТИ ----------
+# ==================== ПУТИ ====================
 DATA_DIR = "data"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TOKEN_FILE = os.path.join(DATA_DIR, "token.txt")
@@ -33,51 +30,81 @@ STATE_FILE = os.path.join(DATA_DIR, "state.json")
 BLACKLIST_FILE = os.path.join(DATA_DIR, "blacklist.json")
 BOTS_WHITELIST_FILE = os.path.join(DATA_DIR, "known_giveaway_bots.json")
 
-# ---------- НАСТРОЙКИ ----------
-MESSAGES_TO_CHECK = 50
-DELAY_BETWEEN_CHANNELS = 1.0
-DELAY_BETWEEN_PARTICIPATION = 2.0
-AUTO_SCAN_INTERVAL = 900
-MAX_CHANNELS_PER_PROFILE = 100
-MAX_POST_AGE_DAYS = 30  # Исключать посты старше 1 месяца
+# ==================== НАСТРОЙКИ ====================
+SCAN_INTERVAL = 900
+REPORT_INTERVAL = 1800
+MESSAGES_TO_CHECK = 40
+DELAY_BETWEEN_CHANNELS = 1.5
+DELAY_BETWEEN_PARTICIPATION = 3.0
+MAX_CHANNELS_PER_PROFILE = 120
+MAX_POST_AGE_DAYS = 30
+MIN_SCORE = 5
 
-# Популярные боты-рандомайзеры и сервисы розыгрышей (username без @)
-DEFAULT_GIVEAWAY_BOTS = [
-    "givesharebot", "voterbibot", "randstuff_bot", "random1zebot",
-    "givaway_bot", "getlike_bot", "contestsbot", "lizaonair_bot"
+# ==================== КЛЮЧЕВЫЕ СЛОВА ====================
+STRONG_GIVEAWAY = [
+    "розыгрыш", "разыгрываю", "разыгрываем", "разыгрывается", "разыграю", "разыграем",
+    "giveaway", "give away", "конкурс", "raffle", "выиграй", "выиграть", "выиграл",
+    "раздача", "раздаю", "раздаем", "халява",
+    "принять участие", "прими участие", "участвуй", "участвуйте", "я в деле",
+    "разагривается", "приз", "prize", "победитель получит", "победитель",
+    "winner will get", "contest", "бесплатная раздача",
+]
+
+WEAK_GIVEAWAY = [
+    "бесплатно", "free", "подарок", "дарю", "дарим", "подарю",
+    "шанс", "chance", "получить", "получи", "gift", "бонус", "bonus",
+    "промокод", "promocode", "promo code",
+]
+
+CONDITION_MARKERS = [
+    "подпишитесь", "подписаться на", "нужна подписка", "subscribe to",
+    "перейдите", "нажмите", "выполните", "условия участия",
+    "чтобы участвовать", "to participate", "to enter", "обязательное условие",
+]
+
+NEGATIVE = [
+    "реклама", "рекламный", "продам", "продается", "продаю", "купить", "куплю",
+    "цена", "стоимость", "оплата", "прайс", "обзор", "рейтинг", "новости", "новость",
+    "подборка", "топ-", "топ ", "обсуждение", "вопрос", "помогите", "подскажите",
+    "как получить", "инструкция", "гайд", "туториал", "скачать", "apk", "взлом",
+    "чит", "cheat", "mod menu", "взломанный", "инвайт", "invite",
+    "предзаказ", "pre-order", "вопрос-ответ", "faq",
 ]
 
 PRESET_CHANNELS = [
-    "gtavi247", "cyberleekgtaviofficial", "gta6deluxe", "gta_6_play",
-    "GTA6_m", "GTA6_6", "igropapka", "gta_6d", "gta_6k", "mir_gta6",
-    "gta6side", "gta6_dailyy", "GrandTheftAuto6_ru", "gta6blog",
-    "gta6main", "gta6princ", "ru_gtavi", "psforgta", "gta6news",
-    "gtanews", "rockstar_hub", "gta6_leaks", "gta6_community",
-    "minecraft_news", "mcpe_hub", "minecraft_giveaway", "free_minecraft"
+    "giveaway_ru", "giveaway_tg", "tg_giveaways", "giveaway_all",
+    "free_telegram", "giveaway_channel", "tg_giveaway_hub",
+    "contests_ru", "raffle_ru", "giveaway_hunter",
 ]
 
-GIVEAWAY_MARKERS = [
-    "розыгрыш", "разыгрываю", "разыгрываем", "разыграю", "разыграем",
-    "конкурс", "приз", "выиграй", "выиграть", "выиграл", "giveaway",
-    "win", "free", "бесплатно", "подарок", "дарю", "дарим",
-    "участвуй", "участвовать", "принять участие", "прими участие",
-    "join", "enter", "take part", "выигрывай", "получи шанс",
-    "шанс выиграть", "разыгрывается", "подарю", "раздача", "раздаю", "халява"
+SEARCH_QUERIES = [
+    "giveaway", "розыгрыш", "конкурс", "раздача", "халява",
+    "giveaway steam", "giveaway pc", "giveaway iphone",
+    "giveaway crypto", "giveaway premium",
+    "розыгрыш пк", "розыгрыш денег", "розыгрыш айфон",
+    "розыгрыш премиум", "розыгрыш крипты", "giveaway nft",
+    "free nft", "раздача крипты", "розыгрыш телефона",
 ]
 
-GTA6_MENTIONS = [
-    "gta vi", "gta 6", "gta6", "grand theft auto vi", "grand theft auto 6",
-    "гта 6", "гта6", "гта vi", "гтаvi", "гта-6", "gta", "гта", "rockstar"
+PARTICIPATE_MARKERS = [
+    "участв", "принять участие", "прими участие", "принять",
+    "join", "enter", "розыгрыш", "начать", "start",
+    "я в деле", "хочу участвовать", "участие",
+    "take part", "i'm in", "i am in", "получить", "получи",
+    "играть", "play", "крутить", "spin",
 ]
 
-PARTICIPATE_BUTTON_MARKERS = [
-    "участв", "участвую", "принять участие", "прими участие",
-    "join", "enter", "giveaway", "розыгрыш", "start", "я в деле",
-    "хочу участвовать", "участие", "take part", "i'm in", "get it", "получить"
+SUBSCRIBE_MARKERS = [
+    "подписаться", "subscribe", "подпишись", "проверить подписку",
+    "check subscription", "проверить", "check",
+    "я подписался", "i subscribed", "готово", "done",
+    "продолжить", "continue",
 ]
 
-SUBSCRIBE_BUTTON_MARKERS = [
-    "подписаться", "subscribe", "проверить подписку", "check subscription", "проверить", "check"
+DEFAULT_BOTS = [
+    "givesharebot", "voterbibot", "randstuff_bot", "random1zebot",
+    "givaway_bot", "getlike_bot", "contestsbot", "lizaonair_bot",
+    "giveawaybot", "tgiveawaybot",
 ]
 
 DEFAULT_CONFIG = {
@@ -85,27 +112,25 @@ DEFAULT_CONFIG = {
     "api_hash": "",
     "phone": "",
     "your_id": 0,
-    "auto_scan_interval_seconds": AUTO_SCAN_INTERVAL,
+    "auto_scan_interval_seconds": SCAN_INTERVAL,
+    "report_interval_seconds": REPORT_INTERVAL,
     "messages_to_check": MESSAGES_TO_CHECK,
     "max_channels_per_profile": MAX_CHANNELS_PER_PROFILE,
     "max_participations_per_run": 0,
     "max_participations_per_day": 0,
+    "min_score_for_participation": MIN_SCORE,
     "profiles": {
-        "GTA VI": {
-            "channel_keywords": ["GTA VI", "GTA6", "GTA 6", "ГТА 6", "ГТА6", "Grand Theft Auto 6"],
-            "contest_keywords": GIVEAWAY_MARKERS,
-            "topic_keywords": GTA6_MENTIONS,
-            "require_buttons": False,
-        },
-        "MINECRAFT": {
-            "channel_keywords": ["Minecraft", "Майнкрафт", "mcpe"],
-            "contest_keywords": GIVEAWAY_MARKERS,
-            "topic_keywords": ["minecraft", "майнкрафт", "mcpe", "java", "bedrock"],
-            "require_buttons": False,
-        },
+        "ALL GIVEAWAYS": {
+            "channel_keywords": [
+                "giveaway", "розыгрыш", "конкурс", "раздача", "халява", "free"
+            ],
+            "topic_keywords": [],
+            "min_score": MIN_SCORE,
+        }
     },
 }
 
+# ==================== ГЛОБАЛЬНОЕ СОСТОЯНИЕ ====================
 bot_client = None
 user_client = None
 config_data = DEFAULT_CONFIG
@@ -113,33 +138,44 @@ config_data = DEFAULT_CONFIG
 _scan_running = False
 _stop_event = None
 
-def _is_unlimited(v) -> bool:
-    try:
-        return int(v) <= 0
-    except Exception:
-        return True
+# Буфер для отчёта
+_pending_report = {
+    "participated": [],   # [{link, channel, date}]
+    "subscribed": set(),  # {channel_username}
+    "failed": [],         # [{link, channel, reason}]
+}
 
+
+# ==================== I/O ====================
 def ensure_data_dir():
     if not os.path.isdir(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
+
 
 def load_config() -> dict:
     ensure_data_dir()
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
-        raise FileNotFoundError(f"Создан шаблон {CONFIG_FILE}. Заполните api_id, api_hash, your_id.")
+        raise FileNotFoundError(
+            f"Создан шаблон {CONFIG_FILE}. Заполните api_id, api_hash, your_id."
+        )
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    if "profiles" not in cfg:
+    for k, v in DEFAULT_CONFIG.items():
+        if k not in cfg:
+            cfg[k] = v
+    if not cfg.get("profiles"):
         cfg["profiles"] = DEFAULT_CONFIG["profiles"]
     save_config(cfg)
     return cfg
+
 
 def save_config(cfg: dict):
     ensure_data_dir()
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
 
 def load_history() -> dict:
     ensure_data_dir()
@@ -148,19 +184,18 @@ def load_history() -> dict:
     try:
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            return {uid: {"status": "unknown", "date": ""} for uid in data}
-        return data
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
 
 def save_history(history: dict):
     ensure_data_dir()
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+
 def load_blacklist() -> list:
-    ensure_data_dir()
     if not os.path.exists(BLACKLIST_FILE):
         return []
     try:
@@ -169,30 +204,33 @@ def load_blacklist() -> list:
     except Exception:
         return []
 
+
 def save_blacklist(bl: list):
     ensure_data_dir()
     with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
         json.dump(bl, f, ensure_ascii=False, indent=2)
 
+
 def load_giveaway_bots() -> list:
     ensure_data_dir()
     if not os.path.exists(BOTS_WHITELIST_FILE):
-        save_giveaway_bots(DEFAULT_GIVEAWAY_BOTS)
-        return DEFAULT_GIVEAWAY_BOTS
+        save_giveaway_bots(DEFAULT_BOTS)
+        return list(DEFAULT_BOTS)
     try:
         with open(BOTS_WHITELIST_FILE, "r", encoding="utf-8") as f:
             bots = json.load(f)
-            return list(set(bots + DEFAULT_GIVEAWAY_BOTS))
+        return list(set(bots + DEFAULT_BOTS))
     except Exception:
-        return DEFAULT_GIVEAWAY_BOTS
+        return list(DEFAULT_BOTS)
+
 
 def save_giveaway_bots(bots: list):
     ensure_data_dir()
     with open(BOTS_WHITELIST_FILE, "w", encoding="utf-8") as f:
         json.dump(list(set(bots)), f, ensure_ascii=False, indent=2)
 
+
 def load_state() -> dict:
-    ensure_data_dir()
     if not os.path.exists(STATE_FILE):
         return {"date": "", "participated_today": 0}
     try:
@@ -201,20 +239,23 @@ def load_state() -> dict:
     except Exception:
         return {"date": "", "participated_today": 0}
 
+
 def save_state(state: dict):
     ensure_data_dir()
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
+
 def read_bot_token(path: str) -> str:
     ensure_data_dir()
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Файл с токеном не найден: {path}.")
+        raise FileNotFoundError(f"Файл с токеном не найден: {path}")
     with open(path, "r", encoding="utf-8") as f:
         token = f.read().strip()
     if not token:
         raise ValueError(f"Файл {path} пустой.")
     return token
+
 
 def read_session_string(path: str):
     if not os.path.exists(path):
@@ -223,116 +264,202 @@ def read_session_string(path: str):
         s = f.read().strip()
     return s or None
 
+
 def save_session_string(path: str, session: str):
     ensure_data_dir()
     with open(path, "w", encoding="utf-8") as f:
         f.write(session)
 
+
+# ==================== УТИЛИТЫ ====================
 def normalize_text(text: str) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", text.lower().strip())
 
-def contains_any(text: str, keywords) -> bool:
-    if not text or not keywords:
-        return False
-    norm = normalize_text(text)
-    return any(normalize_text(kw) in norm for kw in keywords if kw)
+
+def get_message_text(msg) -> str:
+    if not msg:
+        return ""
+    return (
+        getattr(msg, "raw_text", None)
+        or getattr(msg, "text", None)
+        or getattr(msg, "message", None)
+        or ""
+    )
+
+
+def text_hash(text: str) -> str:
+    if not text:
+        return ""
+    return hashlib.md5(normalize_text(text)[:300].encode("utf-8")).hexdigest()[:16]
+
 
 def extract_bot_username_from_url(url: str) -> str:
     if not url:
         return ""
-    match = re.search(r"t\.me/([a-zA-Z0-9_]+)", url)
-    return match.group(1).lower() if match else ""
+    m = re.search(r"t\.me/([a-zA-Z0-9_]+)", url)
+    return m.group(1).lower() if m else ""
 
-def is_from_giveaway_bot(msg) -> bool:
-    known_bots = [b.lower() for b in load_giveaway_bots()]
-    
-    # 1. Проверка через via_bot (инлайн боты)
-    via_bot_id = getattr(msg, "via_bot_id", None)
-    if via_bot_id:
-        return True  # Инлайн боты часто используются для интерактивных конкурсов
 
-    # 2. Проверка через пересылку (fwd_from)
-    fwd = getattr(msg, "fwd_from", None)
-    if fwd and getattr(fwd, "from_id", None):
-        # Если переслано от юзера/бота (в Telethon ID бота можно проверить отдельно или сохранить)
-        pass
-
-    # 3. Проверка кнопок на наличие ссылок на ботов
-    if msg.buttons:
-        for row in msg.buttons:
-            for btn in row:
-                url = getattr(btn, "url", "")
-                if url:
-                    b_name = extract_bot_username_from_url(url)
-                    if b_name in known_bots:
-                        return True
-    return False
-
-def is_relevant_post(msg, profile: dict, ch_title: str = "", ch_username: str = "") -> bool:
-    text = getattr(msg, "text", None)
+def find_bot_mention(text: str) -> str:
     if not text:
-        return False
+        return ""
+    m = re.search(r"@([a-zA-Z][a-zA-Z0-9_]{4,31}bot)\b", text, re.IGNORECASE)
+    return m.group(1).lower() if m else ""
 
-    # Исключение старых постов (старше 30 дней)
-    if msg.date:
-        msg_date = msg.date
-        if msg_date.tzinfo is None:
-            msg_date = msg_date.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        if (now - msg_date) > timedelta(days=MAX_POST_AGE_DAYS):
-            return False
 
-    # Проверка черного списка каналов
-    blacklist = load_blacklist()
-    if ch_username and ch_username.lower() in [b.lower() for b in blacklist]:
-        return False
-
-    contest_kw = profile.get("contest_keywords", GIVEAWAY_MARKERS)
-    topic_kw = profile.get("topic_keywords", [])
-
-    has_contest_markers = contains_any(text, contest_kw)
-    is_bot_post = is_from_giveaway_bot(msg)
-
-    # Если пост от проверенного бота-рандомайзера, порог доверия выше
-    if is_bot_post:
-        # Проверяем хотя бы наличие топика или ключевика игры
-        if topic_kw and not (contains_any(text, topic_kw) or contains_any(ch_title, topic_kw)):
-            return False
+def is_unlimited(v) -> bool:
+    try:
+        return int(v) <= 0
+    except Exception:
         return True
 
-    if not has_contest_markers:
-        return False
 
-    if topic_kw:
-        in_text = contains_any(text, topic_kw)
-        in_channel = contains_any(ch_title, topic_kw) or contains_any(ch_username, topic_kw)
-        if not (in_text or in_channel):
-            return False
-
-    return True
-
+# ==================== КЛАССИФИКАЦИЯ ====================
 def find_participate_button(msg):
-    if not msg or not msg.buttons:
+    if not msg or not getattr(msg, "buttons", None):
         return None
     for row in msg.buttons:
         for btn in row:
-            t = (btn.text or "").lower()
-            if any(m in t for m in PARTICIPATE_BUTTON_MARKERS):
+            t = (getattr(btn, "text", "") or "").lower()
+            if any(m in t for m in PARTICIPATE_MARKERS):
                 return btn
     return None
+
 
 def find_subscribe_button(msg):
-    if not msg or not msg.buttons:
+    if not msg or not getattr(msg, "buttons", None):
         return None
     for row in msg.buttons:
         for btn in row:
-            t = (btn.text or "").lower()
-            if any(m in t for m in SUBSCRIBE_BUTTON_MARKERS):
+            t = (getattr(btn, "text", "") or "").lower()
+            if any(m in t for m in SUBSCRIBE_MARKERS):
                 return btn
     return None
 
+
+def classify_post(msg, profile: dict, ch_title: str, ch_username: str):
+    """
+    Возвращает (is_giveaway, score, reasons).
+    Умный скоринг: ловит реальные розыгрыши, режет новости/рекламу.
+    """
+    text = get_message_text(msg)
+    if not text or len(text) < 15:
+        return False, 0, ["empty"]
+
+    # Возраст поста
+    msg_date = getattr(msg, "date", None)
+    if msg_date:
+        if msg_date.tzinfo is None:
+            msg_date = msg_date.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - msg_date) > timedelta(days=MAX_POST_AGE_DAYS):
+            return False, 0, ["old"]
+
+    norm = normalize_text(text)
+    score = 0
+    reasons = []
+
+    # 1) Сильные маркеры
+    strong_hits = sum(1 for kw in STRONG_GIVEAWAY if normalize_text(kw) in norm)
+    if strong_hits:
+        score += min(strong_hits, 3) * 4
+        reasons.append(f"strong:{strong_hits}")
+
+    # 2) Слабые маркеры
+    weak_hits = sum(1 for kw in WEAK_GIVEAWAY if normalize_text(kw) in norm)
+    if weak_hits:
+        score += min(weak_hits, 3)
+        reasons.append(f"weak:{weak_hits}")
+
+    # 3) Условия участия
+    cond_hits = sum(1 for kw in CONDITION_MARKERS if normalize_text(kw) in norm)
+    if cond_hits:
+        score += min(cond_hits, 2) * 2
+        reasons.append(f"cond:{cond_hits}")
+
+    # 4) Негативные маркеры — жирный минус
+    neg_hits = sum(1 for kw in NEGATIVE if normalize_text(kw) in norm)
+    if neg_hits:
+        score -= min(neg_hits, 4) * 6
+        reasons.append(f"neg:{neg_hits}")
+
+    # 5) Кнопки
+    has_part_btn = find_participate_button(msg) is not None
+    has_sub_btn = find_subscribe_button(msg) is not None
+    if has_part_btn:
+        score += 5
+        reasons.append("btn_part")
+    if has_sub_btn:
+        score += 2
+        reasons.append("btn_sub")
+
+    # 6) Кнопка/ссылка на известного бота
+    known_bots = [b.lower() for b in load_giveaway_bots()]
+    if getattr(msg, "buttons", None):
+        for row in msg.buttons:
+            for btn in row:
+                url = getattr(btn, "url", "") or ""
+                if "t.me/" in url:
+                    bn = extract_bot_username_from_url(url)
+                    if bn and (bn in known_bots or bn.endswith("bot")):
+                        score += 3
+                        reasons.append(f"bot:{bn}")
+                        break
+
+    # 7) Упоминание бота в тексте
+    bot_mention = find_bot_mention(text)
+    if bot_mention:
+        score += 2
+        reasons.append(f"bot_mention:{bot_mention}")
+
+    # 8) Название канала
+    ch_lower = (ch_title + " " + ch_username).lower()
+    if any(w in ch_lower for w in (
+        "giveaway", "розыгрыш", "конкурс", "раздача",
+        "free", "подарок", "бесплат", "халява", "raffle",
+    )):
+        score += 3
+        reasons.append("channel_name")
+
+    # 9) Длинный пост — вероятно новость
+    if len(text) > 3000:
+        score -= 5
+        reasons.append("too_long")
+
+    # 10) Короткий пост без кнопок
+    if len(text) < 60 and not has_part_btn:
+        score -= 4
+        reasons.append("too_short_no_btn")
+
+    # 11) Эмодзи-подарки
+    if re.search(r"[🎁🎉🎊🏆🎯💰💎🔥🎰]", text):
+        score += 1
+
+    threshold = int(profile.get("min_score", MIN_SCORE))
+    return score >= threshold, score, reasons
+
+
+def is_duplicate_text(history: dict, ch_username: str, text: str) -> bool:
+    """Тот же самый текст поста в этом же канале за последние 14 дней."""
+    if not text:
+        return False
+    th = text_hash(text)
+    cutoff = datetime.now() - timedelta(days=14)
+    for uid, info in history.items():
+        if not uid.startswith(f"{ch_username}:"):
+            continue
+        if info.get("text_hash") != th:
+            continue
+        try:
+            if datetime.fromisoformat(info.get("date", "")) > cutoff:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+# ==================== АВТОРИЗАЦИЯ ====================
 async def qr_auth(cfg: dict, b_client):
     u_client = TelegramClient(StringSession(), cfg["api_id"], cfg["api_hash"])
     await u_client.connect()
@@ -350,7 +477,6 @@ async def qr_auth(cfg: dict, b_client):
     buf = BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
-
     await b_client.send_file(cfg["your_id"], buf, caption="[QR] Отсканируйте код в Telegram.")
 
     try:
@@ -362,76 +488,199 @@ async def qr_auth(cfg: dict, b_client):
         await b_client.send_message(cfg["your_id"], "[2FA] Введите облачный пароль:")
         queue = asyncio.Queue()
 
-        @b_client.on(events.NewMessage(from_users=cfg["your_id"]))
         async def password_handler(event):
             await queue.put(event.raw_text.strip())
 
+        b_client.add_event_handler(password_handler, events.NewMessage(from_users=cfg["your_id"]))
         try:
             password = await asyncio.wait_for(queue.get(), timeout=120)
             await u_client.sign_in(password=password)
+        except PasswordHashInvalidError:
+            await b_client.send_message(cfg["your_id"], "[-] Неверный пароль 2FA.")
+            await u_client.disconnect()
+            raise
         finally:
             b_client.remove_event_handler(password_handler)
-            
+
     save_session_string(SESSION_FILE, u_client.session.save())
     await b_client.send_message(cfg["your_id"], "[+] Авторизация успешна.")
     return u_client
 
-async def try_participate(u_client, msg, channel_username: str, message_id: int):
+
+# ==================== УЧАСТИЕ ====================
+async def try_join_channel(u_client, ch_username: str) -> bool:
+    """True если подписка была новой."""
     try:
+        ch = await u_client.get_entity(ch_username)
+    except Exception:
+        return False
+    try:
+        await u_client(JoinChannelRequest(ch))
+        return True
+    except UserAlreadyParticipantError:
+        return False
+    except ChannelsTooMuchError:
+        raise
+    except Exception:
+        return False
+
+
+async def try_participate(u_client, msg, ch_username: str):
+    """
+    Возвращает dict:
+      status: 'participated' | 'manual_required' | 'failed'
+      reason: str
+      subscribed: bool
+    """
+    result = {"status": "failed", "reason": "", "subscribed": False}
+
+    # 1) Подписываемся на канал
+    try:
+        if await try_join_channel(u_client, ch_username):
+            result["subscribed"] = True
+            await asyncio.sleep(1.2)
+    except FloodWaitError as e:
+        result["reason"] = f"FloodWait {e.seconds}с"
+        raise
+
+    # 2) Кнопка в текущем сообщении
+    btn = find_participate_button(msg)
+    sub_btn = find_subscribe_button(msg)
+
+    if not btn and not sub_btn:
+        result["reason"] = "Нет кнопки участия"
+        return result
+
+    # 3) Если только кнопка подписки — жмём, потом ищем кнопку участия
+    if not btn and sub_btn:
+        url = getattr(sub_btn, "url", "") or ""
+        if url:
+            bn = extract_bot_username_from_url(url)
+            if bn:
+                try:
+                    await u_client.send_message(bn, "/start")
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+                result["status"] = "manual_required"
+                result["reason"] = f"Бот @{bn} — подписка/участие вручную"
+                return result
+            result["status"] = "manual_required"
+            result["reason"] = "Кнопка ведёт на внешнюю ссылку"
+            return result
         try:
-            ch = await u_client.get_entity(channel_username)
-            await u_client(JoinChannelRequest(ch))
+            await sub_btn.click()
+            await asyncio.sleep(2)
+            fresh = await u_client.get_messages(ch_username, ids=msg.id)
+            if fresh:
+                msg = fresh
+                btn = find_participate_button(fresh)
         except Exception:
             pass
 
-        await asyncio.sleep(0.5)
-        msg = await u_client.get_messages(channel_username, ids=message_id)
-        if not msg or not msg.buttons:
-            return ("link_only", "Нет интерактивных кнопок")
+    if not btn:
+        result["reason"] = "Кнопка участия не появилась"
+        return result
 
-        btn = find_participate_button(msg) or find_subscribe_button(msg)
-        if btn is None:
-            return ("link_only", "Кнопка не найдена")
+    # 4) Если кнопка — URL (бот/внешняя ссылка) — пытаемся стартовать бота
+    url = getattr(btn, "url", "") or ""
+    if url:
+        bn = extract_bot_username_from_url(url)
+        if bn:
+            bots = load_giveaway_bots()
+            if bn not in bots:
+                bots.append(bn)
+                save_giveaway_bots(bots)
+            try:
+                await u_client.send_message(bn, "/start")
+                await asyncio.sleep(1.5)
+            except Exception:
+                pass
+            result["status"] = "manual_required"
+            result["reason"] = f"Участие в боте @{bn}"
+            return result
+        result["status"] = "manual_required"
+        result["reason"] = "Внешняя ссылка"
+        return result
 
-        # Если кнопка со ссылкой на бота, пытаемся вытащить имя бота и сохранить в белый список
-        url = getattr(btn, "url", None)
-        if url:
-            b_name = extract_bot_username_from_url(url)
-            if b_name:
-                bots = load_giveaway_bots()
-                if b_name not in bots:
-                    bots.append(b_name)
-                    save_giveaway_bots(bots)
-
-        if url:
-            return ("link_only", "Ссылка на бота / внешняя ссылка")
-
+    # 5) Callback-кнопка — кликаем
+    try:
         await btn.click()
-        return ("participated", "OK")
+        result["status"] = "participated"
+        return result
+    except FloodWaitError as e:
+        result["reason"] = f"FloodWait {e.seconds}с"
+        raise
     except Exception as e:
-        return ("failed", str(e)[:80])
+        result["reason"] = f"Ошибка: {str(e)[:60]}"
+        return result
 
-async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=False, debug=False):
-    global _scan_running, _stop_event
 
-    if _scan_running and not debug:
-        await b_client.send_message(cfg["your_id"], "[!] Скан уже запущен. Нажмите «СБРОСИТЬ ЗАВИСАНИЕ» в меню.")
+# ==================== СКАНЕР ====================
+async def discover_channels(u_client, profile: dict, max_channels: int) -> dict:
+    """Возвращает {id: entity} каналов для проверки."""
+    found = {}
+    keywords = profile.get("channel_keywords", [])
+
+    # 1) Пресеты
+    for uname in PRESET_CHANNELS:
+        try:
+            ent = await asyncio.wait_for(u_client.get_entity(uname), timeout=3.0)
+            if ent:
+                found[ent.id] = ent
+        except Exception:
+            pass
+
+    # 2) Поиск по ключам профиля
+    for kw in keywords:
+        try:
+            r = await asyncio.wait_for(
+                u_client(SearchRequest(q=kw, limit=30)), timeout=6.0
+            )
+            for chat in r.chats:
+                if isinstance(chat, (Channel, Chat)) and getattr(chat, "username", None):
+                    found[chat.id] = chat
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
+    # 3) Поиск по общим giveaway-запросам (если профиль "all")
+    if not keywords or any("giveaway" in k.lower() for k in keywords):
+        for q in SEARCH_QUERIES:
+            try:
+                r = await asyncio.wait_for(
+                    u_client(SearchRequest(q=q, limit=20)), timeout=6.0
+                )
+                for chat in r.chats:
+                    if isinstance(chat, (Channel, Chat)) and getattr(chat, "username", None):
+                        found[chat.id] = chat
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)
+
+    return dict(list(found.items())[:max_channels])
+
+
+async def run_parser_task(b_client, u_client, cfg, auto_mode=False):
+    global _scan_running, _stop_event, _pending_report
+
+    if _scan_running and not auto_mode:
+        await b_client.send_message(
+            cfg["your_id"],
+            "[!] Скан уже запущен. Нажмите «СБРОСИТЬ ЗАВИСАНИЕ».",
+        )
         return
 
     _scan_running = True
     _stop_event = asyncio.Event()
 
     try:
-        profiles_to_run = {}
-        if profile_name and profile_name in cfg["profiles"]:
-            profiles_to_run[profile_name] = cfg["profiles"][profile_name]
-        else:
-            profiles_to_run = cfg["profiles"]
-
-        if not profiles_to_run:
+        profiles = cfg.get("profiles", {})
+        if not profiles:
             return
 
         history = load_history()
+        seen_uids = set(history.keys())
         state = load_state()
 
         today = datetime.now().strftime("%Y-%m-%d")
@@ -444,46 +693,23 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
         messages_to_check = int(cfg.get("messages_to_check", MESSAGES_TO_CHECK))
         max_channels = int(cfg.get("max_channels_per_profile", MAX_CHANNELS_PER_PROFILE))
 
-        participated_this_run = 0
-        new_posts = []
-        total_channels = 0
+        participated_run = 0
+        blacklist = [b.lower() for b in load_blacklist()]
 
         if not auto_mode:
-            await b_client.send_message(cfg["your_id"], "[~] Запущен поиск розыгрышей (фильтр: не старше 30 дней)...")
+            await b_client.send_message(cfg["your_id"], "[~] Запуск умного поиска розыгрышей...")
 
-        for prof_name, data in profiles_to_run.items():
+        for prof_name, data in profiles.items():
             if _stop_event.is_set():
                 break
 
-            channel_kw = data.get("channel_keywords", [])
-            found_channels = {}
+            try:
+                channels = await discover_channels(u_client, data, max_channels)
+            except Exception as e:
+                print(f"[discover] {e}")
+                continue
 
-            for uname in PRESET_CHANNELS:
-                if _stop_event.is_set():
-                    break
-                try:
-                    entity = await asyncio.wait_for(u_client.get_entity(uname), timeout=3.0)
-                    if entity:
-                        found_channels[entity.id] = entity
-                except Exception:
-                    pass
-
-            for kw in channel_kw:
-                if _stop_event.is_set():
-                    break
-                try:
-                    result = await asyncio.wait_for(u_client(SearchRequest(q=kw, limit=30)), timeout=5.0)
-                    for chat in result.chats:
-                        if isinstance(chat, (Channel, Chat)) and getattr(chat, "username", None):
-                            found_channels[chat.id] = chat
-                except Exception:
-                    pass
-                await asyncio.sleep(0.2)
-
-            channels_list = list(found_channels.values())[:max_channels]
-            total_channels += len(channels_list)
-
-            for ch in channels_list:
+            for ch_id, ch in channels.items():
                 if _stop_event.is_set():
                     break
 
@@ -491,11 +717,13 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                 ch_username = getattr(ch, "username", "") or ""
                 if not ch_username:
                     continue
+                if ch_username.lower() in blacklist:
+                    continue
 
                 try:
                     messages = await asyncio.wait_for(
                         u_client.get_messages(ch, limit=messages_to_check),
-                        timeout=8.0
+                        timeout=10.0,
                     )
                 except Exception:
                     continue
@@ -503,110 +731,249 @@ async def run_parser_task(b_client, u_client, cfg, profile_name=None, auto_mode=
                 for msg in messages:
                     if _stop_event.is_set():
                         break
-                    if not msg or not msg.text:
+                    if not msg:
+                        continue
+
+                    text = get_message_text(msg)
+                    if not text:
                         continue
 
                     uid = f"{ch_username}:{msg.id}"
-                    if uid in history:
+                    if uid in seen_uids:
                         continue
 
-                    if not is_relevant_post(msg, data, ch_title, ch_username):
+                    is_ga, score, _reasons = classify_post(msg, data, ch_title, ch_username)
+                    if not is_ga:
                         continue
 
+                    # Дубль текста (репост того же розыгрыша)
+                    if is_duplicate_text(history, ch_username, text):
+                        history[uid] = {
+                            "status": "duplicate_skip",
+                            "date": datetime.now().isoformat(timespec="seconds"),
+                            "text_hash": text_hash(text),
+                        }
+                        seen_uids.add(uid)
+                        continue
+
+                    run_ok = is_unlimited(max_per_run) or participated_run < max_per_run
+                    day_ok = is_unlimited(max_per_day) or state["participated_today"] < max_per_day
+
+                    if not (run_ok and day_ok):
+                        history[uid] = {
+                            "status": "limit_skip",
+                            "date": datetime.now().isoformat(timespec="seconds"),
+                            "text_hash": text_hash(text),
+                        }
+                        seen_uids.add(uid)
+                        continue
+
+                    # Пробуем участие
                     link = f"https://t.me/{ch_username}/{msg.id}"
-                    
-                    run_limit_ok = _is_unlimited(max_per_run) or participated_this_run < max_per_run
-                    day_limit_ok = _is_unlimited(max_per_day) or state["participated_today"] < max_per_day
+                    try:
+                        res = await try_participate(u_client, msg, ch_username)
+                    except FloodWaitError as e:
+                        await notify_critical(
+                            b_client, cfg,
+                            f"FloodWait при участии: {e.seconds}с. Скан остановлен."
+                        )
+                        _stop_event.set()
+                        break
 
-                    if run_limit_ok and day_limit_ok:
-                        status, detail = await try_participate(u_client, msg, ch_username, msg.id)
-                        if status == "participated":
-                            state["participated_today"] += 1
-                            participated_this_run += 1
-                        await asyncio.sleep(DELAY_BETWEEN_PARTICIPATION)
-                    else:
-                        status, detail = "link_only", "Лимит исчерпан"
+                    status = res["status"]
+                    reason = res["reason"]
+                    subscribed = res.get("subscribed", False)
+
+                    if status == "participated":
+                        state["participated_today"] += 1
+                        participated_run += 1
+                        _pending_report["participated"].append({
+                            "link": link,
+                            "channel": ch_username,
+                            "date": datetime.now().isoformat(timespec="seconds"),
+                        })
+                    elif status == "manual_required":
+                        _pending_report["failed"].append({
+                            "link": link,
+                            "channel": ch_username,
+                            "reason": reason,
+                        })
+
+                    if subscribed:
+                        _pending_report["subscribed"].add(ch_username)
 
                     history[uid] = {
                         "status": status,
-                        "detail": detail,
+                        "detail": reason,
                         "date": datetime.now().isoformat(timespec="seconds"),
-                        "link": link,
-                        "profile": prof_name,
-                        "channel": ch_title or ch_username,
-                    }
-                    new_posts.append({
-                        "uid": uid,
-                        "status": status,
-                        "detail": detail,
+                        "text_hash": text_hash(text),
                         "link": link,
                         "profile": prof_name,
                         "channel": ch_username,
-                        "text": msg.text[:400],
-                    })
+                        "channel_title": ch_title,
+                    }
+                    seen_uids.add(uid)
 
+                    await asyncio.sleep(DELAY_BETWEEN_PARTICIPATION)
+
+                save_history(history)
                 await asyncio.sleep(DELAY_BETWEEN_CHANNELS)
 
         save_history(history)
         save_state(state)
 
-        for p in new_posts:
-            marker = {
-                "participated": "[+] УЧАСТИЕ",
-                "link_only": "[•] РОЗЫГРЫШ",
-                "failed": "[-] ОШИБКА",
-            }.get(p["status"], "[?]")
-
-            text = (
-                f"<b>{marker}</b>\n"
-                f"[{p['profile']}] @{p['channel']}\n\n"
-                f"{p['text'][:300]}...\n\n"
-                f"<a href=\"{p['link']}\">Перейти к посту</a>"
-            )
-            buttons = [
-                [Button.url("🔗 Открыть пост", p["link"])],
-                [Button.inline(f"❌ В черный список @{p['channel']}", data=f"bl_add_{p['channel']}".encode())]
-            ]
-            try:
-                await b_client.send_message(cfg["your_id"], text, parse_mode="html", link_preview=False, buttons=buttons)
-            except Exception:
-                pass
-            await asyncio.sleep(0.4)
-
         if not auto_mode:
             await b_client.send_message(
                 cfg["your_id"],
-                f"<b>[#] ПОИСК ЗАВЕРШЕН</b>\n"
-                f"Каналов проверено: {total_channels}\n"
-                f"Новых постов найдено: {len(new_posts)}",
-                parse_mode="html"
+                f"<b>[#] СКАН ЗАВЕРШЁН</b>\n"
+                f"Участий за запуск: {participated_run}",
+                parse_mode="html",
             )
+
     except Exception as e:
-        await b_client.send_message(cfg["your_id"], f"[-] Ошибка выполнения скана: {str(e)[:100]}")
+        await notify_critical(b_client, cfg, f"Ошибка сканера: {str(e)[:120]}")
     finally:
         _scan_running = False
         if _stop_event:
             _stop_event.clear()
 
-async def periodic_scanner(b_client, u_client, cfg, interval: int):
+
+# ==================== ОТЧЁТЫ ====================
+async def notify_critical(b_client, cfg, text: str):
+    try:
+        await b_client.send_message(
+            cfg["your_id"],
+            f"🚨 <b>КРИТИЧЕСКАЯ ОШИБКА</b>\n\n{text}",
+            parse_mode="html",
+        )
+    except Exception:
+        pass
+
+
+async def send_report(b_client, cfg):
+    global _pending_report
+
+    part = _pending_report["participated"]
+    subs = _pending_report["subscribed"]
+    fails = _pending_report["failed"]
+
+    if not part and not subs and not fails:
+        return  # нет активности — молчим
+
+    text = "<b>[ОТЧЁТ ЗА 30 МИНУТ]</b>\n\n"
+    text += f"✅ Поучаствовал в розыгрышах: <b>{len(part)}</b>\n"
+    text += f"📢 Подписался на каналов: <b>{len(subs)}</b>\n"
+    text += f"⚠️ Требуют ручного участия: <b>{len(fails)}</b>\n"
+
+    if fails:
+        text += "\n<b>Ручное участие (нужна ваша ссылка):</b>\n"
+        for f in fails[:8]:
+            text += f"• @{f['channel']} — {f['reason']}\n"
+        if len(fails) > 8:
+            text += f"...и ещё {len(fails) - 8}\n"
+
+    buttons = []
+    for f in fails[:10]:
+        buttons.append([Button.url(f"🔗 @{f['channel']}", f["link"])])
+    buttons.append([Button.inline("📋 Все мои розыгрыши", data=b"my_giveaways")])
+
+    try:
+        await b_client.send_message(
+            cfg["your_id"], text,
+            buttons=buttons, parse_mode="html", link_preview=False,
+        )
+    except Exception:
+        pass
+
+    _pending_report = {
+        "participated": [],
+        "subscribed": set(),
+        "failed": [],
+    }
+
+
+async def periodic_scanner(b_client, u_client, cfg):
     await asyncio.sleep(30)
+    interval = int(cfg.get("auto_scan_interval_seconds", SCAN_INTERVAL))
     while True:
         if not _scan_running:
             try:
                 await run_parser_task(b_client, u_client, cfg, auto_mode=True)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[scanner] {e}")
         await asyncio.sleep(interval)
 
-def get_main_menu_buttons(cfg):
-    running_label = "[■] СТОП (идёт скан)" if _scan_running else "[■] СТОП"
+
+async def periodic_reporter(b_client, cfg):
+    await asyncio.sleep(30)
+    interval = int(cfg.get("report_interval_seconds", REPORT_INTERVAL))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await send_report(b_client, cfg)
+        except Exception as e:
+            print(f"[reporter] {e}")
+
+
+# ==================== UI ====================
+def get_main_menu_buttons():
+    running = " ■ СТОП" if _scan_running else ""
     return [
-        [Button.inline("[>] ЗАПУСТИТЬ ПОИСК", data=b"run_all")],
+        [Button.inline(f"[>] ЗАПУСТИТЬ ПОИСК{running}", data=b"run_all")],
         [Button.inline("[=] ПРОФИЛИ", data=b"manage_profiles")],
-        [Button.inline(running_label, data=b"stop_scan")],
+        [Button.inline("📋 ВСЕ МОИ РОЗЫГРЫШИ", data=b"my_giveaways")],
         [Button.inline("[!] СБРОСИТЬ ЗАВИСАНИЕ", data=b"force_reset")],
-        [Button.inline("[x] СБРОСИТЬ ИСТОРИЮ", data=b"clear_history")],
+        [Button.inline("🚫 ЧЁРНЫЙ СПИСОК", data=b"view_blacklist")],
     ]
+
+
+async def show_my_giveaways(event, page: int = 0):
+    history = load_history()
+    items = []
+    for uid, info in history.items():
+        st = info.get("status")
+        if st in ("participated", "manual_required", "failed"):
+            items.append((uid, info))
+
+    items.sort(key=lambda x: x[1].get("date", ""), reverse=True)
+
+    if not items:
+        await event.edit(
+            "📋 Розыгрышей пока нет.",
+            buttons=[[Button.inline("« Назад", data=b"main_menu")]],
+        )
+        return
+
+    page_size = 8
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    chunk = items[page * page_size:(page + 1) * page_size]
+
+    text = f"<b>[МОИ РОЗЫГРЫШИ]</b> ({page + 1}/{total_pages})\n\n"
+    for _, info in chunk:
+        st = info.get("status")
+        emoji = {
+            "participated": "✅",
+            "manual_required": "⚠️",
+            "failed": "❌",
+        }.get(st, "•")
+        date = (info.get("date", "") or "")[:16].replace("T", " ")
+        ch = info.get("channel", "?")
+        link = info.get("link", "")
+        text += f"{emoji} {date} — @{ch}\n<a href=\"{link}\">→ открыть пост</a>\n\n"
+
+    btns = []
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("◀️", data=f"my_ga_{page-1}".encode()))
+    nav.append(Button.inline(f"{page+1}/{total_pages}", data=b"ignore"))
+    if page < total_pages - 1:
+        nav.append(Button.inline("▶️", data=f"my_ga_{page+1}".encode()))
+    btns.append(nav)
+    btns.append([Button.inline("« В главное меню", data=b"main_menu")])
+
+    await event.edit(text, buttons=btns, parse_mode="html", link_preview=False)
+
 
 async def setup_bot_handlers(b_client):
     @b_client.on(events.NewMessage(pattern="/start"))
@@ -615,8 +982,7 @@ async def setup_bot_handlers(b_client):
             return
         await event.respond(
             "<b>[ПАНЕЛЬ УПРАВЛЕНИЯ]</b>\n\nВыберите действие:",
-            buttons=get_main_menu_buttons(config_data),
-            parse_mode="html",
+            buttons=get_main_menu_buttons(), parse_mode="html",
         )
 
     @b_client.on(events.NewMessage(pattern="/reset"))
@@ -632,39 +998,91 @@ async def setup_bot_handlers(b_client):
     @b_client.on(events.CallbackQuery)
     async def cb(event):
         global config_data, user_client, _scan_running, _stop_event
+
         if event.sender_id != int(config_data["your_id"]):
             return
 
         data = event.data.decode("utf-8")
 
         if data == "main_menu":
-            await event.edit("<b>[ГЛАВНОЕ МЕНЮ]</b>", buttons=get_main_menu_buttons(config_data), parse_mode="html")
+            await event.edit(
+                "<b>[ГЛАВНОЕ МЕНЮ]</b>",
+                buttons=get_main_menu_buttons(), parse_mode="html",
+            )
+        elif data == "ignore":
+            await event.answer()
         elif data == "run_all":
             if _scan_running:
                 await event.answer("Скан уже идёт", alert=True)
                 return
-            await event.edit("[~] Запуск...")
-            asyncio.create_task(run_parser_task(b_client, user_client, config_data))
-        elif data == "stop_scan":
-            if _scan_running and _stop_event and not _stop_event.is_set():
-                _stop_event.set()
-                await event.answer("Остановка...", alert=True)
-            else:
-                await event.answer("Скан не запущен", alert=True)
+            await event.edit("[~] Запуск умного поиска...")
+            asyncio.create_task(
+                run_parser_task(b_client, user_client, config_data, auto_mode=False)
+            )
+            await asyncio.sleep(1)
+            await event.edit(
+                "<b>[ГЛАВНОЕ МЕНЮ]</b>",
+                buttons=get_main_menu_buttons(), parse_mode="html",
+            )
         elif data == "force_reset":
             _scan_running = False
             if _stop_event:
                 _stop_event.set()
-            await event.answer("Зависание сброшено!", alert=True)
-            await event.edit("<b>[ГЛАВНОЕ МЕНЮ]</b>", buttons=get_main_menu_buttons(config_data), parse_mode="html")
+            await event.answer("Сброшено!", alert=True)
+            await event.edit(
+                "<b>[ГЛАВНОЕ МЕНЮ]</b>",
+                buttons=get_main_menu_buttons(), parse_mode="html",
+            )
+        elif data == "my_giveaways":
+            await show_my_giveaways(event, 0)
+        elif data.startswith("my_ga_"):
+            try:
+                p = int(data.replace("my_ga_", ""))
+            except ValueError:
+                p = 0
+            await show_my_giveaways(event, p)
+        elif data == "view_blacklist":
+            bl = load_blacklist()
+            if not bl:
+                await event.edit(
+                    "🚫 Чёрный список пуст.",
+                    buttons=[[Button.inline("« Назад", data=b"main_menu")]],
+                )
+                return
+            text = "<b>[ЧЁРНЫЙ СПИСОК]</b>\n\n"
+            for ch in bl:
+                text += f"• @{ch}\n"
+            btns = [[Button.inline(f"❌ Удалить @{ch}", data=f"bl_del_{ch}".encode())] for ch in bl[:10]]
+            btns.append([Button.inline("« Назад", data=b"main_menu")])
+            await event.edit(text, buttons=btns, parse_mode="html")
+        elif data.startswith("bl_del_"):
+            ch = data.replace("bl_del_", "")
+            bl = load_blacklist()
+            bl = [b for b in bl if b.lower() != ch.lower()]
+            save_blacklist(bl)
+            await event.answer(f"@{ch} удалён из ЧС", alert=True)
+            await event.edit(
+                "<b>[ГЛАВНОЕ МЕНЮ]</b>",
+                buttons=get_main_menu_buttons(), parse_mode="html",
+            )
+        elif data.startswith("bl_add_"):
+            ch = data.replace("bl_add_", "")
+            bl = load_blacklist()
+            if ch.lower() not in [b.lower() for b in bl]:
+                bl.append(ch)
+                save_blacklist(bl)
+            await event.answer(f"@{ch} добавлен в ЧС", alert=True)
         elif data == "manage_profiles":
             profiles = list(config_data["profiles"].keys())
             if not profiles:
-                await event.edit("📂 Нет профилей.", buttons=[[Button.inline("« Назад", data=b"main_menu")]])
+                await event.edit(
+                    "📂 Нет профилей.",
+                    buttons=[[Button.inline("« Назад", data=b"main_menu")]],
+                )
                 return
             btns = [[Button.inline(f"📁 {p}", data=f"edit_p_{p}".encode())] for p in profiles]
             btns.append([Button.inline("« Назад", data=b"main_menu")])
-            await event.edit("<b>[УПРАВЛЕНИЕ ПРОФИЛЯМИ]</b>", buttons=btns, parse_mode="html")
+            await event.edit("<b>[ПРОФИЛИ]</b>", buttons=btns, parse_mode="html")
         elif data.startswith("edit_p_"):
             p_name = data.replace("edit_p_", "")
             prof = config_data["profiles"].get(p_name, {})
@@ -672,35 +1090,35 @@ async def setup_bot_handlers(b_client):
             text = (
                 f"<b>Профиль: {p_name}</b>\n\n"
                 f"Ключи каналов: <code>{ch_kw}</code>\n"
+                f"Мин. скоринг: <code>{prof.get('min_score', MIN_SCORE)}</code>\n"
             )
             btns = [
                 [Button.inline("🗑 Удалить профиль", data=f"del_p_{p_name}".encode())],
-                [Button.inline("« К списку", data=b"manage_profiles")]
+                [Button.inline("« К списку", data=b"manage_profiles")],
             ]
             await event.edit(text, buttons=btns, parse_mode="html")
         elif data.startswith("del_p_"):
             p_name = data.replace("del_p_", "")
             config_data["profiles"].pop(p_name, None)
             save_config(config_data)
-            await event.edit(f"🗑 Профиль <b>{p_name}</b> удален.", buttons=get_main_menu_buttons(config_data), parse_mode="html")
-        elif data.startswith("bl_add_"):
-            chan = data.replace("bl_add_", "")
-            bl = load_blacklist()
-            if chan.lower() not in [b.lower() for b in bl]:
-                bl.append(chan)
-                save_blacklist(bl)
-            await event.answer(f"Канал @{chan} добавлен в черный список!", alert=True)
-        elif data == "clear_history":
-            save_history({})
-            await event.answer("История сброшена", alert=True)
-            await event.edit("<b>[ГЛАВНОЕ МЕНЮ]</b>", buttons=get_main_menu_buttons(config_data), parse_mode="html")
+            await event.edit(
+                f"🗑 Профиль <b>{p_name}</b> удалён.",
+                buttons=get_main_menu_buttons(), parse_mode="html",
+            )
 
+
+# ==================== MAIN ====================
 async def main():
     global bot_client, user_client, config_data
+
     config_data = load_config()
     bot_token = read_bot_token(TOKEN_FILE)
 
-    bot_client = TelegramClient(os.path.join(DATA_DIR, "bot_session"), config_data["api_id"], config_data["api_hash"])
+    bot_client = TelegramClient(
+        os.path.join(DATA_DIR, "bot_session"),
+        config_data["api_id"],
+        config_data["api_hash"],
+    )
     await bot_client.start(bot_token=bot_token)
     print("[+] Бот запущен.")
 
@@ -709,7 +1127,11 @@ async def main():
     session_string = read_session_string(SESSION_FILE)
     user_client = None
     if session_string:
-        user_client = TelegramClient(StringSession(session_string), config_data["api_id"], config_data["api_hash"])
+        user_client = TelegramClient(
+            StringSession(session_string),
+            config_data["api_id"],
+            config_data["api_hash"],
+        )
         await user_client.connect()
         if not await user_client.is_user_authorized():
             await user_client.disconnect()
@@ -718,10 +1140,11 @@ async def main():
     if user_client is None:
         user_client = await qr_auth(config_data, bot_client)
 
-    interval = int(config_data.get("auto_scan_interval_seconds", AUTO_SCAN_INTERVAL))
-    asyncio.create_task(periodic_scanner(bot_client, user_client, config_data, interval))
-    
+    asyncio.create_task(periodic_scanner(bot_client, user_client, config_data))
+    asyncio.create_task(periodic_reporter(bot_client, config_data))
+
     await bot_client.run_until_disconnected()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
